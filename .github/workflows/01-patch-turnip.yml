@@ -1,0 +1,104 @@
+name: 1 - Patch Turnip
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: Banner GPU patch variant
+        type: choice
+        options: [standard, a8xx, 710-720-test, 8g2-oneui]
+        default: standard
+      mesa_ref:
+        description: Upstream Mesa main or a full upstream commit SHA
+        type: string
+        default: main
+  push:
+    branches: [main]
+    paths: ['droiddeck/**', '.github/workflows/01-patch-turnip.yml']
+  pull_request:
+    paths: ['droiddeck/**', '.github/workflows/01-patch-turnip.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', inputs.variant)) || fromJSON('["standard","a8xx","710-720-test","8g2-oneui"]') }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: recipe
+          persist-credentials: false
+      - name: Test pipeline controls
+        run: python3 -m unittest discover -s recipe/droiddeck/tests -v
+      - name: Resolve and prepare upstream Mesa
+        id: mesa
+        env:
+          MESA_REF: ${{ inputs.mesa_ref || 'main' }}
+        run: |
+          set -euo pipefail
+          [[ "$MESA_REF" == main || "$MESA_REF" =~ ^[0-9a-f]{40}$ ]] || { echo 'Use main or a full upstream SHA'; exit 1; }
+          git -C recipe remote add mesa-upstream https://gitlab.freedesktop.org/mesa/mesa.git
+          git -C recipe fetch --no-tags --depth=1 mesa-upstream "$MESA_REF"
+          commit=$(git -C recipe rev-parse FETCH_HEAD)
+          git -C recipe worktree add --detach "$GITHUB_WORKSPACE/mesa" "$commit"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - name: Apply Banner variant and local extra patches
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: python3 recipe/droiddeck/pipeline.py banner mesa --variant "$VARIANT"
+      - name: Save source for review
+        id: source
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          branch="codex/turnip/$VARIANT/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          git -C mesa config user.name 'github-actions[bot]'
+          git -C mesa config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C mesa switch -c "$branch"
+          git -C mesa add -A
+          git -C mesa commit -m "Turnip: apply $VARIANT Banner patch series"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git -C mesa rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Check DroidDeck Linux patch compatibility
+        run: |
+          set -euo pipefail
+          git -C mesa worktree add --detach "$GITHUB_WORKSPACE/linux-check" HEAD
+          python3 recipe/droiddeck/pipeline.py linux linux-check
+      - name: Push review branch
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.source.outputs.branch }}
+        run: |
+          set -euo pipefail
+          gh auth setup-git
+          git -C mesa push "https://github.com/$GITHUB_REPOSITORY.git" "HEAD:refs/heads/$BRANCH"
+      - name: Source patch artifact
+        run: git -C mesa diff --binary "${{ steps.mesa.outputs.commit }}" HEAD > prepared-turnip.patch
+      - uses: actions/upload-artifact@v7
+        with:
+          name: patched-turnip-${{ matrix.variant }}
+          path: |
+            prepared-turnip.patch
+            mesa/.droiddeck-turnip.json
+          include-hidden-files: true
+          if-no-files-found: error
+      - name: Next step
+        env:
+          BRANCH: ${{ steps.source.outputs.branch }}
+          COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          {
+            echo "Prepared source: \`$COMMIT\`"
+            echo "Review branch: \`$BRANCH\` (pushed on manual runs only)."
+            echo 'Review or add source commits, then run **2 - Build DroidDeck Linux ZIP** with that branch or SHA.'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,15 @@
+Bannerlator linuxfs (tools/linuxfs/turnip), 2026-09-20.
+The two KGSL fixes the Linux runtime needs, both device-proven there:
+
+kgsl-drm-node.patch
+  KGSL exposes no DRM render node, so Turnip reported no DRM device and a Wayland
+  compositor's dma-buf feedback and the WSI could not agree on a main device.
+  Reports /dev/kgsl-3d0's own major:minor as local and master, and lets
+  VK_EXT_physical_device_drm advertise when it is known.
+
+kgsl-no-calibrated-timestamps.patch
+  kgsl cannot read the GPU counter (kgsl_device_get_gpu_timestamp was
+  UNREACHABLE("")), yet VK_KHR/EXT_calibrated_timestamps and VK_EXT_present_timing
+  were advertised from has_persistent_counter alone - so a compositor that used
+  them aborted the process. Gates all three on the kernel interface actually
+  implementing the call. Ported from Max's fix.

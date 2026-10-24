@@ -6,3 +6,8 @@
 *.ico binary
 *.cl gitlab-language=c
 docs/relnotes/new_features.txt merge=union
+droiddeck/** text eol=lf
+.github/workflows/01-patch-turnip.yml text eol=lf
+.github/workflows/02-build-linux.yml text eol=lf
+droiddeck/**/*.patch -whitespace
+droiddeck/vendor/** -whitespace

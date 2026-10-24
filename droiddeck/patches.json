@@ -1,0 +1,23 @@
+{
+  "banner": {
+    "standard": [],
+    "a8xx": [
+      "patches/a8xx-mesa-main.patch",
+      "vendor/banners/patches/a8xx_shared_mem.py"
+    ],
+    "710-720-test": [
+      "vendor/banners/patches/710-720/01-u_gralloc-always-use-ubwc-detection.patch",
+      "vendor/banners/patches/a710-720.py"
+    ],
+    "8g2-oneui": [
+      "vendor/banners/patches/8g2_oneui.py"
+    ]
+  },
+  "extra": [],
+  "linux": [
+    "vendor/drivers/patches/scripts/linux_kgsl_wsi.py",
+    "vendor/drivers/patches/scripts/perf_pwr_max.py",
+    "vendor/drivers/patches/scripts/process_heap_usage.py",
+    "vendor/drivers/patches/lrz/0001-tu-a8xx-lrz-reset-cntl-after-flush.patch"
+  ]
+}

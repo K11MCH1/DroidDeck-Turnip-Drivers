@@ -1,0 +1,19 @@
+DroidDeck pipeline code: GPL-3.0. See vendor/drivers/LICENSE.
+
+Imported Banner patches:
+https://github.com/The412Banner/Banners-Turnip
+commit 74453956af11ca20d8054955580208cc8146695f, branch A8xx.
+Original authors and patch headers are retained under vendor/banners/.
+patches/a8xx-mesa-main.patch combines and rebases a8xx-winnative/0001-0005
+and a8xx_gen8.patch onto Mesa ed2b00fa28dfc60061e21ecbe2280a49940fb470.
+Context and whitespace were updated. The A830 comparison now compares chip_id
+on both sides of ||, correcting an always-true condition in the original stack.
+
+Imported DroidDeck Linux adaptations and sysroot recipe:
+https://github.com/Droid-Deck/Drivers
+commit 6c3f8592535d14e2f1dbe845d0baf7c594b9938f.
+Original files are under vendor/drivers/patches/.
+linux_sysroot.sh is copied from scripts/linux_sysroot.sh.
+build_linux.sh adapts scripts/build_linux.sh by separating patching from compilation.
+
+Mesa's original licensing and file notices continue to apply.

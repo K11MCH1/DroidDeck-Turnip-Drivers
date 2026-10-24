@@ -1,0 +1,128 @@
+[
+  {
+    "file": "scripts/gralloc_ubwc_detect.py",
+    "targets": [
+      "android"
+    ],
+    "summary": "Detect UBWC gralloc buffers without the legacy gmsm header newer Qualcomm gralloc no longer writes"
+  },
+  {
+    "file": "scripts/fix_a8xx_dev_info.py",
+    "targets": [
+      "android",
+      "linux"
+    ],
+    "summary": "Per-GPU disable_gmem property with a sysmem fallback for parts with broken GMEM"
+  },
+  {
+    "file": "scripts/apply_a8xx_gpus.py",
+    "targets": [
+      "android",
+      "linux"
+    ],
+    "summary": "A810 / A829 / A840v2 KGSL chip IDs, A810 / A829 disable_gmem, plus the A825 entry"
+  },
+  {
+    "file": "scripts/apply_a7xx_gen1_quirks.py",
+    "targets": [
+      "android",
+      "linux"
+    ],
+    "summary": "Disable early preamble and scalar predicates on A720 / A725 / A730"
+  },
+  {
+    "file": "scripts/add_aimapper_gralloc.py",
+    "targets": [
+      "android"
+    ],
+    "summary": "IMapper5 stable-C gralloc backend loaded as an SP-HAL (by Leb-Sun)"
+  },
+  {
+    "file": "scripts/add_ubwc_swapchain_usage.py",
+    "targets": [
+      "android"
+    ],
+    "summary": "Request UBWC-compressed swapchain buffers through the AHB usage answer (by Leb-Sun)"
+  },
+  {
+    "file": "scripts/autotune_bandwidth.py",
+    "targets": [
+      "android",
+      "linux"
+    ],
+    "summary": "GMEM autotuner bandwidth multiplier 11 -> 10"
+  },
+  {
+    "file": "scripts/perf_pwr_max.py",
+    "targets": [
+      "android",
+      "linux"
+    ],
+    "summary": "KGSL PWR_MAX constraint at queue creation, refreshed every 1000 submissions"
+  },
+  {
+    "file": "scripts/android_ndk_compat.py",
+    "targets": [
+      "android"
+    ],
+    "summary": "Android stub and warning adjustments for the NDK clang cross build"
+  },
+  {
+    "file": "scripts/linux_kgsl_wsi.py",
+    "targets": [
+      "linux"
+    ],
+    "summary": "KGSL dma-buf feedback device numbers and calibrated timestamp / present timing gating"
+  },
+  {
+    "file": "scripts/process_heap_usage.py",
+    "targets": [
+      "android",
+      "linux"
+    ],
+    "summary": "Memory budget reports the process-wide heap usage, so a D3D12 game reading it through DXVK's DXGI sees vkd3d-proton's allocations"
+  },
+  {
+    "file": "linux/0001-tu-mesh-shader-emulation.patch",
+    "targets": [
+      "linux"
+    ],
+    "summary": "VK_EXT_mesh_shader emulated with compute"
+  },
+  {
+    "file": "linux/0002-ir3-half-wave-subgroups.patch",
+    "targets": [
+      "linux"
+    ],
+    "summary": "Required subgroup size of half a wave on A8XX"
+  },
+  {
+    "file": "linux/0003-ir3-a8xx-cube-direction-sanitize.patch",
+    "targets": [
+      "linux"
+    ],
+    "summary": "Sanitize cube map sampling directions on A8XX"
+  },
+  {
+    "file": "linux/0004-tu-a8xx-bindless-invalidate.patch",
+    "targets": [
+      "linux"
+    ],
+    "summary": "Invalidate bindless descriptors through the A8XX registers"
+  },
+  {
+    "file": "linux/0005-tu-kgsl-a8xx-ib-virtual-alias.patch",
+    "targets": [
+      "linux"
+    ],
+    "summary": "Fetch A8XX command streams through a KGSL virtual BO alias"
+  },
+  {
+    "file": "lrz/0001-tu-a8xx-lrz-reset-cntl-after-flush.patch",
+    "targets": [
+      "android",
+      "linux"
+    ],
+    "summary": "Reset the LRZ controls after the end-of-pass LRZ flush on A8XX, as freedreno does, so a large fast-cleared LRZ buffer no longer hangs the GPU"
+  }
+]

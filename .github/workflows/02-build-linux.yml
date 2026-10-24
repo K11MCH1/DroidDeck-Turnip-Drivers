@@ -1,0 +1,82 @@
+name: 2 - Build DroidDeck Linux ZIP
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Reviewed stage 1 branch or commit, including any manual adjustments
+        type: string
+        required: true
+      version:
+        description: Package version (for example 0.1.0)
+        type: string
+        default: 0.1.0
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: recipe
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+          path: mesa
+          persist-credentials: false
+      - name: Validate version and pipeline controls
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Version must be X.Y.Z'; exit 1; }
+          python3 -m unittest discover -s recipe/droiddeck/tests -v
+      - name: Linux build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu ninja-build flex bison glslang-tools pkg-config \
+            python3-pip libwayland-dev libexpat1-dev cmake
+          python3 -m venv "$RUNNER_TEMP/turnip-tools"
+          "$RUNNER_TEMP/turnip-tools/bin/pip" install 'meson==1.10.2' mako pyyaml packaging
+          echo "$RUNNER_TEMP/turnip-tools/bin" >> "$GITHUB_PATH"
+      - name: Apply DroidDeck Linux adjustments
+        run: python3 recipe/droiddeck/pipeline.py linux mesa
+      - name: Record complete build source
+        run: |
+          set -euo pipefail
+          cp -a recipe/droiddeck mesa/.droiddeck-build-recipe
+          git -C mesa config user.name 'github-actions[bot]'
+          git -C mesa config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C mesa add -A
+          git -C mesa commit -m 'Turnip: apply DroidDeck Linux adaptation and record recipe'
+      - name: Build glibc AArch64 Turnip
+        run: bash recipe/droiddeck/build_linux.sh mesa linux-build
+      - name: Verify and package driver and corresponding source
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          python3 recipe/droiddeck/package.py --mesa mesa --library linux-build/out/libvulkan_freedreno.so \
+            --sysroot linux-build/sysroot --version "$VERSION" --dist dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: DroidDeck-Turnip-Linux-${{ inputs.version }}-${{ github.run_id }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: linux-build-diagnostics-${{ github.run_id }}
+          path: |
+            linux-build/build/meson-logs/
+            mesa/.droiddeck-turnip.json
+          include-hidden-files: true
+          if-no-files-found: ignore
