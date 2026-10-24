@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "mesaCommit": "ed2b00fa28dfc60061e21ecbe2280a49940fb470",
+  "variant": "standard",
+  "mesaVersion": "27.0.0-devel",
+  "recipeCommit": "4e6edf335cdb88f89edf50012f871e814c2274ef",
+  "sources": {
+    "mesa": "https://gitlab.freedesktop.org/mesa/mesa.git",
+    "banners": {
+      "repository": "https://github.com/The412Banner/Banners-Turnip",
+      "branch": "A8xx",
+      "commit": "74453956af11ca20d8054955580208cc8146695f"
+    },
+    "drivers": {
+      "repository": "https://github.com/Droid-Deck/Drivers",
+      "commit": "6c3f8592535d14e2f1dbe845d0baf7c594b9938f"
+    }
+  },
+  "patches": []
+}
