@@ -1216,6 +1216,8 @@ r3d_common(struct tu_cmd_buffer *cmd, struct tu_cs *cs, enum r3d_type type,
          .gfx_shared_const = true,
          .cs_bindless = CHIP == A6XX ? 0x1f : 0xff,
          .gfx_bindless = CHIP == A6XX ? 0x1f : 0xff,));
+   if (CHIP >= A8XX)
+      tu_emit_bindless_invalidate<CHIP>(cs, true, true);
 
    with_crb (cs, 2 * 5 + 2 * 12) {
       tu6_emit_xs_config<CHIP>(crb, { .vs = vs, .fs = fs });
@@ -1896,7 +1898,7 @@ r3d_setup(struct tu_cmd_buffer *cmd,
       tu_cs_emit_call(cs, cmd->device->dbg_renderpass_stomp_cs);
    }
 
-   enum a6xx_format fmt = blit_base_format<CHIP>(dst_format, ubwc, 
+   enum a6xx_format fmt = blit_base_format<CHIP>(dst_format, ubwc,
                                                  blit_param & R3D_DST_GMEM);
    fixup_dst_format(src_format, &dst_format, &fmt);
 
@@ -4097,7 +4099,7 @@ tu_CmdResolveImage2(VkCommandBuffer commandBuffer,
       shader_resolve ? &r3d_ops<CHIP> : &r2d_ops<CHIP>;
 
    ops->setup(cmd, cs, src_format, dst_format,
-              VK_IMAGE_ASPECT_COLOR_BIT, 0, false, dst_image->layout[0].ubwc, 
+              VK_IMAGE_ASPECT_COLOR_BIT, 0, false, dst_image->layout[0].ubwc,
               shader_resolve ? src_samples : VK_SAMPLE_COUNT_1_BIT,
               VK_SAMPLE_COUNT_1_BIT);
 
@@ -5566,7 +5568,7 @@ fdm_apply_blit_scissor(struct tu_cmd_buffer *cmd,
 
    VkRect2D subsampled_render_area =
       transform_render_area(state->render_area, tile, bins, view);
-   VkOffset2D pos = tile->subsampled ? 
+   VkOffset2D pos = tile->subsampled ?
       tile->subsampled_pos[view].offset : common_bin_offset;
 
    VkRect2D scissor = subsampled_render_area;

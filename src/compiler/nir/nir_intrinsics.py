@@ -1312,7 +1312,7 @@ intrinsic("load_fs_input_interp_deltas", src_comp=[1], dest_comp=3,
 # homogeneous W) can be calculated for any screen-space coordinate using a plane
 # equation. polygon_plane_eqn_coefficients_intel returns coefficients of this
 # plane equation, which can then be used to calculate barys and rhw like so:
-# 
+#
 #   vec2 pos = gl_FragCoord.xy - xy_origin /* + offset for interpolateAtOffset */
 #   float result = dot(plane_eqn_*_intel, vec3(pos.xy, 1.0))
 for name in ["bary1", "bary2", "rhw"]:
@@ -1652,6 +1652,9 @@ system_value("tess_factor_base_ir3", 2)
 system_value("tess_param_base_ir3", 2)
 system_value("tcs_header_ir3", 1)
 system_value("rel_patch_id_ir3", 1)
+
+# Base address of turnip's mesh shading ring.
+system_value("mesh_ring_ir3", 2)
 
 # System values for freedreno compute shaders.
 system_value("subgroup_id_shift_ir3", 1)

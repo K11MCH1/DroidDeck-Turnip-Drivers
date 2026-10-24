@@ -14,6 +14,7 @@
 
 #include "tu_cs.h"
 #include "tu_descriptor_set.h"
+#include "tu_mesh.h"
 #include "tu_suballoc.h"
 
 struct tu_inline_ubo
@@ -24,6 +25,9 @@ struct tu_inline_ubo
 
    /* If true, push the base address instead */
    bool push_address;
+
+   /* Push the mesh shading ring address instead of descriptor data */
+   bool mesh_ring;
 
    /* Push it to this location in the const file, in vec4s */
    unsigned const_offset_vec4;
@@ -49,7 +53,7 @@ struct tu_const_state
    struct tu_push_constant_range push_consts;
    uint32_t dynamic_offset_loc;
    unsigned num_inline_ubos;
-   struct tu_inline_ubo ubos[MAX_INLINE_UBOS];
+   struct tu_inline_ubo ubos[MAX_INLINE_UBOS + 1];
    uint32_t num_bindless_base_addresses;
    uint32_t bindless_base_const_offset_vec4;
 
@@ -123,6 +127,9 @@ struct tu_shader
           */
          bool read_only_input_attachments;
       } fs;
+
+      /* Mesh and task shaders compiled to compute. */
+      struct tu_mesh_state mesh;
    };
 };
 
@@ -154,6 +161,7 @@ struct tu_shader_key {
  */
 struct tu_shader_info {
    bool per_layer_viewport;
+   struct tu_mesh_state mesh;
 };
 
 extern const struct vk_pipeline_cache_object_ops tu_shader_ops;
@@ -270,6 +278,9 @@ tu_init_empty_shaders(struct tu_device *device);
 
 void
 tu_destroy_empty_shaders(struct tu_device *device);
+
+VkResult
+tu_init_mesh_shading(struct tu_device *device);
 
 void
 tu_shader_destroy(struct tu_device *dev,

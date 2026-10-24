@@ -57,6 +57,9 @@ struct tu_bo {
     * export file descriptor.
     */
    int shared_fd;
+
+   /* Virtual BO the GPU accesses this BO through, or 0 if none. */
+   uint32_t alias_handle;
 #endif
 
    bool implicit_sync : 1;

@@ -282,6 +282,95 @@ kgsl_align_flag(uint64_t align)
    return 0;
 }
 
+/* On A8XX, freeing IB memory with a plain GPUMEM_FREE_ID leads to GPU hangs,
+ * even when the GPU is idle. Fetching IBs through a virtual BO alias whose
+ * range is unbound before the memory is freed avoids them.
+ */
+static bool
+kgsl_bo_needs_alias(struct tu_device *dev, enum tu_bo_alloc_flags flags)
+{
+   return (flags & TU_BO_ALLOC_NO_32B_ROLLOVER) &&
+          dev->physical_device->has_sparse &&
+          dev->physical_device->info->chip >= A8XX;
+}
+
+static VkResult
+kgsl_bo_create_alias(struct tu_device *dev, struct tu_bo *bo, uint64_t align)
+{
+   int fd = dev->physical_device->local_fd;
+
+   struct kgsl_gpuobj_alloc alloc = {
+      .size = bo->size,
+      .flags = KGSL_MEMFLAGS_VBO | KGSL_MEMFLAGS_VBO_NO_MAP_ZERO |
+               kgsl_align_flag(align),
+   };
+
+   if (safe_ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &alloc)) {
+      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                       "GPUOBJ_ALLOC failed (%s)", strerror(errno));
+   }
+
+   struct kgsl_gpumem_get_info info = {
+      .id = alloc.id,
+   };
+
+   struct kgsl_gpumem_bind_range range = {
+      .length = bo->size,
+      .child_id = bo->gem_handle,
+      .op = KGSL_GPUMEM_RANGE_OP_BIND,
+   };
+
+   struct kgsl_gpumem_bind_ranges bind = {
+      .ranges = (uint64_t)(uintptr_t)&range,
+      .ranges_nents = 1,
+      .ranges_size = sizeof(range),
+      .id = alloc.id,
+   };
+
+   if (safe_ioctl(fd, IOCTL_KGSL_GPUMEM_GET_INFO, &info) ||
+       safe_ioctl(fd, IOCTL_KGSL_GPUMEM_BIND_RANGES, &bind)) {
+      VkResult result =
+         vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                   "binding IB alias failed (%s)", strerror(errno));
+
+      struct kgsl_gpumem_free_id req = {
+         .id = alloc.id,
+      };
+      safe_ioctl(fd, IOCTL_KGSL_GPUMEM_FREE_ID, &req);
+      return result;
+   }
+
+   bo->alias_handle = alloc.id;
+   bo->iova = info.gpuaddr;
+   return VK_SUCCESS;
+}
+
+static void
+kgsl_bo_destroy_alias(struct tu_device *dev, struct tu_bo *bo)
+{
+   int fd = dev->physical_device->local_fd;
+
+   struct kgsl_gpumem_bind_range range = {
+      .length = bo->size,
+      .child_id = bo->gem_handle,
+      .op = KGSL_GPUMEM_RANGE_OP_UNBIND,
+   };
+
+   struct kgsl_gpumem_bind_ranges unbind = {
+      .ranges = (uint64_t)(uintptr_t)&range,
+      .ranges_nents = 1,
+      .ranges_size = sizeof(range),
+      .id = bo->alias_handle,
+   };
+
+   safe_ioctl(fd, IOCTL_KGSL_GPUMEM_BIND_RANGES, &unbind);
+
+   struct kgsl_gpumem_free_id req = {
+      .id = bo->alias_handle,
+   };
+   safe_ioctl(fd, IOCTL_KGSL_GPUMEM_FREE_ID, &req);
+}
+
 static VkResult
 kgsl_bo_init(struct tu_device *dev,
              struct vk_object_base *base,
@@ -373,6 +462,10 @@ kgsl_bo_init(struct tu_device *dev,
       result = kgsl_sparse_vma_map(dev, lazy_vma, bo, 0);
    } else if (flags & TU_BO_ALLOC_REPLAYABLE) {
       result = kgsl_bo_user_map(dev, bo, client_iova);
+   } else if (kgsl_bo_needs_alias(dev, flags)) {
+      result = kgsl_bo_create_alias(dev, bo, align);
+      if (result != VK_SUCCESS)
+         kgsl_bo_finish(dev, bo);
    }
 
    if (result != VK_SUCCESS)
@@ -515,6 +608,9 @@ kgsl_bo_finish(struct tu_device *dev, struct tu_bo *bo)
       close(bo->shared_fd);
 
    TU_RMV(bo_destroy, dev, bo);
+
+   if (bo->alias_handle)
+      kgsl_bo_destroy_alias(dev, bo);
 
    struct kgsl_gpumem_free_id req = {
       .id = bo->gem_handle
@@ -1988,7 +2084,7 @@ tu_knl_kgsl_load(struct tu_instance *instance, int fd)
    device->has_raytracing = tu_kgsl_get_raytracing(fd);
 
    device->submitqueue_priority_count = 1;
-   
+
    device->timeline_type = vk_sync_timeline_get_type(&vk_kgsl_sync_type);
 
    device->sync_types[0] = &vk_kgsl_sync_type;

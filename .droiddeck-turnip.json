@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "mesaCommit": "ed2b00fa28dfc60061e21ecbe2280a49940fb470",
+  "variant": "a8xx",
+  "mesaVersion": "27.0.0-devel",
+  "recipeCommit": "4e6edf335cdb88f89edf50012f871e814c2274ef",
+  "sources": {
+    "mesa": "https://gitlab.freedesktop.org/mesa/mesa.git",
+    "banners": {
+      "repository": "https://github.com/The412Banner/Banners-Turnip",
+      "branch": "A8xx",
+      "commit": "74453956af11ca20d8054955580208cc8146695f"
+    },
+    "drivers": {
+      "repository": "https://github.com/Droid-Deck/Drivers",
+      "commit": "6c3f8592535d14e2f1dbe845d0baf7c594b9938f"
+    }
+  },
+  "patches": [
+    {
+      "file": "patches/a8xx-mesa-main.patch",
+      "sha256": "c982df89e163e622a4b13aeb5e6d9d11af3c89a39fe940d147e333b6895d3c48"
+    },
+    {
+      "file": "vendor/banners/patches/a8xx_shared_mem.py",
+      "sha256": "0224edf819078b0d07b3b375151e57f54571b11ad30dc25f183d664feea24103"
+    }
+  ]
+}

@@ -194,11 +194,31 @@ is_kgsl(struct tu_instance *instance)
    return strcmp(instance->knl->name, "kgsl") == 0;
 }
 
+/* Mesh and task shaders are emulated with compute dispatches inside
+ * sysmem render passes.
+ */
+static bool
+tu_has_mesh_shader(const struct tu_physical_device *device)
+{
+   return device->info->chip >= 7 &&
+          device->info->cs_shared_mem_size >= 32 * 1024;
+}
+
 static uint32_t
 tu_subgroup_size(const struct tu_physical_device *device)
 {
    return device->info->threadsize_base *
           (device->expose_double_threadsize ? 2 : 1);
+}
+
+/* Subgroups of half a wave are emulated on top of the hardware subgroup
+ * operations.
+ */
+static uint32_t
+tu_min_subgroup_size(const struct tu_physical_device *device)
+{
+   return device->info->threadsize_base /
+          (device->info->props.has_getfiberid ? 2 : 1);
 }
 
 static void
@@ -366,6 +386,7 @@ get_device_extensions(const struct tu_physical_device *device,
       .EXT_load_store_op_none = true,
       .EXT_map_memory_placed = true,
       .EXT_memory_budget = true,
+      .EXT_mesh_shader = tu_has_mesh_shader(device),
       .EXT_multi_draw = true,
       .EXT_multisampled_render_to_single_sampled = true,
       .EXT_mutable_descriptor_type = true,
@@ -818,6 +839,13 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->memoryMapRangePlaced = false;
    features->memoryUnmapReserve = true;
 
+   /* VK_EXT_mesh_shader */
+   features->taskShader = tu_has_mesh_shader(pdevice);
+   features->meshShader = tu_has_mesh_shader(pdevice);
+   features->multiviewMeshShader = false;
+   features->primitiveFragmentShadingRateMeshShader = false;
+   features->meshShaderQueries = false;
+
    /* VK_EXT_multi_draw */
    features->multiDraw = true;
 
@@ -982,6 +1010,10 @@ tu_get_physical_device_properties_1_1(struct tu_physical_device *pdevice,
                                     VK_SUBGROUP_FEATURE_ROTATE_CLUSTERED_BIT_KHR |
                                     VK_SUBGROUP_FEATURE_CLUSTERED_BIT |
                                     VK_SUBGROUP_FEATURE_ARITHMETIC_BIT;
+   if (tu_has_mesh_shader(pdevice)) {
+      p->subgroupSupportedStages |=
+         VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT;
+   }
    if (pdevice->info->props.has_getfiberid) {
       p->subgroupSupportedStages |= VK_SHADER_STAGE_ALL_GRAPHICS;
       p->subgroupSupportedOperations |= VK_SUBGROUP_FEATURE_QUAD_BIT;
@@ -1025,6 +1057,12 @@ tu_get_physical_device_properties_1_2(struct tu_physical_device *pdevice,
       .subminor = 6,
       .patch = 1,
    };
+
+   if (TU_DEBUG(DECK_EMU)) {
+      p->driverID = VK_DRIVER_ID_MESA_RADV;
+      memset(p->driverName, 0, sizeof(p->driverName));
+      snprintf(p->driverName, VK_MAX_DRIVER_NAME_SIZE, "radv");
+   }
 
    p->denormBehaviorIndependence =
       VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
@@ -1107,18 +1145,19 @@ static void
 tu_get_physical_device_properties_1_3(struct tu_physical_device *pdevice,
                                       struct vk_properties *p)
 {
-   p->minSubgroupSize = pdevice->info->threadsize_base;
+   p->minSubgroupSize = tu_min_subgroup_size(pdevice);
    p->maxSubgroupSize = tu_subgroup_size(pdevice);
-   p->maxComputeWorkgroupSubgroups = pdevice->info->max_waves;
+   p->maxComputeWorkgroupSubgroups = pdevice->info->max_waves *
+      pdevice->info->threadsize_base / p->minSubgroupSize;
    /* Only compute and fragment shaders can run with a doubled wave size, the
-    * geometry stages always run at threadsize_base.  So when we expose more
-    * than one possible subgroup size we can't honor a required subgroup size
-    * in those stages.
+    * geometry stages always run at threadsize_base.  So when we expose the
+    * doubled size we can't honor a required subgroup size in those stages.
     */
    p->requiredSubgroupSizeStages =
-      p->minSubgroupSize == p->maxSubgroupSize
+      !pdevice->expose_double_threadsize
          ? VK_SHADER_STAGE_ALL
-         : (VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
+         : (VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
+            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT);
 
    p->maxInlineUniformBlockSize = MAX_INLINE_UBO_RANGE;
    p->maxPerStageDescriptorInlineUniformBlocks = MAX_INLINE_UBOS;
@@ -1327,6 +1366,11 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->deviceID = pdevice->dev_id.chip_id;
    props->deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
 
+   if (TU_DEBUG(DECK_EMU)) {
+      props->vendorID = 0x1002;
+      props->deviceID = 0x163F;
+   }
+
    /* Vulkan 1.4 */
    props->dynamicRenderingLocalReadDepthStencilAttachments = true;
    props->dynamicRenderingLocalReadMultisampledAttachments = true;
@@ -1342,6 +1386,10 @@ tu_get_properties(struct tu_physical_device *pdevice,
             (strlen(pdevice->instance->drirc.debug.force_vk_devicename) > 0) ?
             pdevice->instance->drirc.debug.force_vk_devicename : pdevice->name);
    memcpy(props->pipelineCacheUUID, pdevice->cache_uuid, VK_UUID_SIZE);
+
+   if (TU_DEBUG(DECK_EMU)) {
+      strcpy(props->deviceName, "AMD Custom GPU 0405 (RADV VANGOGH)");
+   }
 
    tu_get_physical_device_properties_1_1(pdevice, props);
    tu_get_physical_device_properties_1_2(pdevice, props);
@@ -1450,6 +1498,44 @@ tu_get_properties(struct tu_physical_device *pdevice,
    /* VK_EXT_map_memory_placed */
    os_get_page_size(&os_page_size);
    props->minPlacedMemoryMapAlignment = os_page_size;
+
+   /* VK_EXT_mesh_shader */
+   props->maxTaskWorkGroupTotalCount = 1u << 22;
+   props->maxTaskWorkGroupCount[0] = 65535;
+   props->maxTaskWorkGroupCount[1] = 65535;
+   props->maxTaskWorkGroupCount[2] = 65535;
+   props->maxTaskWorkGroupInvocations = 128;
+   props->maxTaskWorkGroupSize[0] = 128;
+   props->maxTaskWorkGroupSize[1] = 128;
+   props->maxTaskWorkGroupSize[2] = 128;
+   props->maxTaskPayloadSize = 16384;
+   props->maxTaskSharedMemorySize = 32768;
+   props->maxTaskPayloadAndSharedMemorySize = 32768;
+   props->maxMeshWorkGroupTotalCount = 1u << 22;
+   props->maxMeshWorkGroupCount[0] = 65535;
+   props->maxMeshWorkGroupCount[1] = 65535;
+   props->maxMeshWorkGroupCount[2] = 65535;
+   props->maxMeshWorkGroupInvocations = 128;
+   props->maxMeshWorkGroupSize[0] = 128;
+   props->maxMeshWorkGroupSize[1] = 128;
+   props->maxMeshWorkGroupSize[2] = 128;
+   props->maxMeshSharedMemorySize = 28672;
+   props->maxMeshPayloadAndSharedMemorySize = 16384 + 28672;
+   props->maxMeshOutputMemorySize = 32768;
+   props->maxMeshPayloadAndOutputMemorySize = 16384 + 32768;
+   props->maxMeshOutputComponents = 128;
+   props->maxMeshOutputVertices = 256;
+   props->maxMeshOutputPrimitives = 256;
+   props->maxMeshOutputLayers = 8;
+   props->maxMeshMultiviewViewCount = 1;
+   props->meshOutputPerVertexGranularity = 1;
+   props->meshOutputPerPrimitiveGranularity = 1;
+   props->maxPreferredTaskWorkGroupInvocations = 64;
+   props->maxPreferredMeshWorkGroupInvocations = 128;
+   props->prefersLocalInvocationVertexOutput = true;
+   props->prefersLocalInvocationPrimitiveOutput = true;
+   props->prefersCompactVertexOutput = true;
+   props->prefersCompactPrimitiveOutput = true;
 
    /* VK_EXT_multi_draw */
    props->maxMultiDrawCount = 2048;
@@ -1635,7 +1721,7 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->conservativeRasterizationPostDepthCoverage = false;
 
    /* VK_EXT_fragment_density_map_offset */
-   props->fragmentDensityOffsetGranularity = (VkExtent2D) { 
+   props->fragmentDensityOffsetGranularity = (VkExtent2D) {
       TU_FDM_OFFSET_GRANULARITY, TU_FDM_OFFSET_GRANULARITY
    };
 
@@ -2877,6 +2963,9 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
          &dispatch_table, &tu_device_entrypoints_a8xx, false);
    }
 
+   /* HACK: disable concurrent binning for now */
+   tu_env.debug |= TU_DEBUG_NO_CONCURRENT_BINNING;
+
    vk_device_dispatch_table_from_entrypoints(
       &dispatch_table, &wsi_device_entrypoints, false);
 
@@ -3377,6 +3466,11 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    tu_destroy_clear_blit_shaders(device);
 
    tu_destroy_empty_shaders(device);
+
+   if (device->mesh_setup)
+      vk_pipeline_cache_object_unref(&device->vk, &device->mesh_setup->base);
+   if (device->mesh_ring)
+      tu_bo_finish(device, device->mesh_ring);
 
    tu_destroy_dynamic_rendering(device);
 

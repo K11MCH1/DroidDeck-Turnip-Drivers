@@ -70,7 +70,7 @@ struct tu_nir_shaders
    /* This is optional, and is only filled out when a library pipeline is
     * compiled with RETAIN_LINK_TIME_OPTIMIZATION_INFO.
     */
-   nir_shader *nir[MESA_SHADER_STAGES];
+   nir_shader *nir[MESA_SHADER_MESH_STAGES];
 };
 
 extern const struct vk_pipeline_cache_object_ops tu_nir_shaders_ops;
@@ -120,7 +120,7 @@ struct tu_program_state
        * possible scenarios based on the shader and whether multiview or
        * per-layer sampling is enabled, that are communicated to the driver
        * via the struct members below:
-       * 
+       *
        * - The shader writes gl_ViewportIndex, managing multiple viewports in
        *   a way that may not correspond to FDM layer:
        *   - Set everything to false. The driver will set shared_scale and
@@ -163,6 +163,7 @@ struct tu_pipeline_executable {
    mesa_shader_stage stage;
 
    struct ir3_info stats;
+   uint32_t subgroup_size;
    bool is_binning;
 
    char *nir_from_spirv;
@@ -216,7 +217,7 @@ struct tu_pipeline
    /* draw states for the pipeline */
    struct tu_draw_state load_state;
 
-   struct tu_shader *shaders[MESA_SHADER_STAGES];
+   struct tu_shader *shaders[MESA_SHADER_MESH_STAGES];
 
    struct tu_program_state program;
 
@@ -243,7 +244,7 @@ struct tu_graphics_lib_pipeline {
    struct {
       nir_shader *nir;
       struct tu_shader_key key;
-   } shaders[MESA_SHADER_FRAGMENT + 1];
+   } shaders[MESA_SHADER_MESH_STAGES];
 
    /* Used to stitch together an overall layout for the final pipeline. */
    struct tu_descriptor_set_layout *layouts[MAX_SETS];
@@ -313,6 +314,12 @@ tu6_emit_xs_config(struct tu_crb &crb,
 template <chip CHIP>
 void
 tu6_emit_shared_consts_enable(struct tu_crb &crb, bool shared_consts_enable);
+
+void
+tu6_emit_dynamic_offset(struct tu_cs *cs,
+                        const struct ir3_shader_variant *xs,
+                        const struct tu_shader *shader,
+                        const struct tu_program_state *program);
 
 template <chip CHIP>
 void

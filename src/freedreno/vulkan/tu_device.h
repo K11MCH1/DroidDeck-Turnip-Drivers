@@ -380,6 +380,12 @@ struct tu_device
    /* Lazily allocated, protected by the device mutex. */
    struct tu_bo *tess_bo;
 
+   /* Mesh shading emulation state, created with the first mesh pipeline and
+    * protected by the device mutex.
+    */
+   struct tu_bo *mesh_ring;
+   struct tu_shader *mesh_setup;
+
    struct ir3_shader_variant *global_shader_variants[GLOBAL_SH_COUNT];
    struct ir3_shader *global_shaders[GLOBAL_SH_COUNT];
    uint64_t global_shader_va[GLOBAL_SH_COUNT];
@@ -729,7 +735,7 @@ tu_bo_init_new_cached(struct tu_device *dev, struct vk_object_base *base,
       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-         (dev->physical_device->has_cached_coherent_memory ? 
+         (dev->physical_device->has_cached_coherent_memory ?
           VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0),
       flags, NULL, name);
 }

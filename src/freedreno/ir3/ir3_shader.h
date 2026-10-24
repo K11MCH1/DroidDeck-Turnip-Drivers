@@ -145,6 +145,8 @@ enum ir3_wavesize_option {
    IR3_SINGLE_ONLY,
    IR3_SINGLE_OR_DOUBLE,
    IR3_DOUBLE_ONLY,
+   /* Subgroups of half a single wave, emulated on single waves. */
+   IR3_HALF_ONLY,
 };
 
 /**

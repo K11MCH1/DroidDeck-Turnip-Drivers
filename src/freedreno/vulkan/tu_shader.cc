@@ -1216,7 +1216,8 @@ lower_inline_ubo(nir_builder *b, nir_intrinsic_instr *intrin, void *cb_data)
       params->dev->physical_device->info->props.load_inline_uniforms_via_preamble_ldgk;
 
    for (unsigned i = 0; i < const_state->num_inline_ubos; i++) {
-      if (const_state->ubos[i].base == binding.desc_set &&
+      if (!const_state->ubos[i].mesh_ring &&
+          const_state->ubos[i].base == binding.desc_set &&
           const_state->ubos[i].offset == binding_layout->offset) {
          range = const_state->ubos[i].size_vec4 * 16;
          if (use_ldg_k) {
@@ -1267,6 +1268,46 @@ lower_inline_ubo(nir_builder *b, nir_intrinsic_instr *intrin, void *cb_data)
    }
 
    nir_def_replace(&intrin->def, val);
+   return true;
+}
+
+static bool
+shader_uses_mesh_ring(nir_shader *shader)
+{
+   nir_foreach_function_impl (impl, shader) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic ==
+                   nir_intrinsic_load_mesh_ring_ir3)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
+static bool
+lower_mesh_ring(nir_builder *b, nir_intrinsic_instr *intrin, void *cb_data)
+{
+   if (intrin->intrinsic != nir_intrinsic_load_mesh_ring_ir3)
+      return false;
+
+   struct lower_instr_params *params = (struct lower_instr_params *) cb_data;
+   struct tu_const_state *const_state = &params->shader->const_state;
+   unsigned i = const_state->num_inline_ubos - 1;
+   assert(const_state->ubos[i].mesh_ring);
+
+   b->cursor = nir_before_instr(&intrin->instr);
+   nir_def *addr;
+   if (params->dev->physical_device->info->props.load_inline_uniforms_via_preamble_ldgk) {
+      addr = ir3_load_driver_ubo(b, 2, &const_state->inline_uniforms_ubo, i * 2);
+   } else {
+      addr = nir_load_const_ir3(b, 2, 32, nir_imm_int(b, 0),
+                                .base = const_state->ubos[i].const_offset_vec4 * 4);
+   }
+
+   nir_def_replace(&intrin->def, addr);
    return true;
 }
 
@@ -1604,6 +1645,20 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
       }
    }
 
+   if (shader_uses_mesh_ring(shader)) {
+      const_state->ubos[const_state->num_inline_ubos++] =
+         (struct tu_inline_ubo) {
+            .push_address = !use_ldg_k,
+            .mesh_ring = true,
+            .const_offset_vec4 =
+               const_allocs->max_const_offset_vec4 + ldgk_consts,
+            .size_vec4 = 1,
+         };
+
+      if (!use_ldg_k)
+         ldgk_consts += align(1, dev->compiler->const_upload_unit);
+   }
+
    ir3_const_alloc(const_allocs, IR3_CONST_ALLOC_INLINE_UNIFORM_ADDRS, ldgk_consts, 1);
 
    if (dev->physical_device->compiler_options.enable_ssbo_emulation) {
@@ -1636,6 +1691,9 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
       progress |= nir_shader_intrinsics_pass(shader, lower_inline_ubo,
                                                nir_metadata_none,
                                                &params);
+      progress |= nir_shader_intrinsics_pass(shader, lower_mesh_ring,
+                                             nir_metadata_control_flow,
+                                             &params);
    }
 
    progress |= nir_shader_instructions_pass(shader,
@@ -3430,6 +3488,9 @@ tu_shader_cache_process_blob(IO &io, struct tu_shader *shader)
    case MESA_SHADER_FRAGMENT:
       io.bytes(&shader->fs, sizeof(shader->fs));
       break;
+   case MESA_SHADER_COMPUTE:
+      io.bytes(&shader->mesh, sizeof(shader->mesh));
+      break;
    default:
       break;
    }
@@ -3668,6 +3729,8 @@ tu_shader_create(struct tu_device *dev,
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
    shader->per_layer_viewport = info->per_layer_viewport;
+   if (nir->info.stage == MESA_SHADER_COMPUTE)
+      shader->mesh = info->mesh;
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT &&
        key->fdm_per_layer) {
@@ -3881,6 +3944,50 @@ tu6_get_tessmode(const struct nir_shader *shader)
    }
 }
 
+/* Replaces the task and mesh shaders with compute shaders feeding a
+ * generated vertex shader.
+ */
+static void
+tu_lower_mesh_pipeline(struct tu_device *dev, nir_shader **nir,
+                       struct tu_shader_info *info, void *mem_ctx)
+{
+   nir_shader *ms = nir[MESA_SHADER_MESH];
+   struct tu_mesh_io io;
+   tu_mesh_gather_io(ms, &io);
+
+   nir[MESA_SHADER_VERTEX] =
+      tu_mesh_build_vs(ms, &io, ir3_get_compiler_options(dev->compiler));
+   ralloc_steal(mem_ctx, nir[MESA_SHADER_VERTEX]);
+
+   unsigned payload_stride = 0;
+   if (nir[MESA_SHADER_TASK]) {
+      payload_stride = tu_mesh_lower_ts(nir[MESA_SHADER_TASK]);
+      info[MESA_SHADER_TASK].mesh = (struct tu_mesh_state) {
+         .chunk_workgroups = tu_mesh_task_chunk(payload_stride),
+         .task_payload_stride = payload_stride,
+      };
+   }
+
+   VkPrimitiveTopology topology =
+      io.verts_per_prim == 1 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST :
+      io.verts_per_prim == 2 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST :
+                               VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+   tu_mesh_lower_ms(ms, &io, payload_stride);
+   info[MESA_SHADER_MESH].mesh = (struct tu_mesh_state) {
+      .stride = io.stride,
+      .chunk_workgroups = io.chunk_workgroups,
+      .task_payload_stride = payload_stride,
+      .max_primitives = (uint16_t) io.max_primitives,
+      .verts_per_prim = (uint8_t) io.verts_per_prim,
+      .topology = (uint8_t) topology,
+   };
+
+   if (nir[MESA_SHADER_FRAGMENT])
+      tu_mesh_lower_fs_inputs(nir[MESA_SHADER_FRAGMENT],
+                              io.writes_primitive_id);
+}
+
 VkResult
 tu_compile_shaders(struct tu_device *device,
                    VkPipelineCreateFlags2KHR pipeline_flags,
@@ -3896,11 +4003,13 @@ tu_compile_shaders(struct tu_device *device,
                    VkPipelineCreationFeedback *stage_feedbacks)
 {
    struct ir3_shader_key ir3_key = {};
-   struct tu_shader_info info[MESA_SHADER_STAGES] = {};
+   struct tu_shader_info info[MESA_SHADER_MESH_STAGES] = {};
+   nir_shader *mesh_nir[2] = {};
    VkResult result = VK_SUCCESS;
    void *mem_ctx = ralloc_context(NULL);
 
-   for (mesa_shader_stage stage = MESA_SHADER_VERTEX; stage < MESA_SHADER_STAGES;
+   for (mesa_shader_stage stage = MESA_SHADER_VERTEX;
+        stage < MESA_SHADER_MESH_STAGES;
         stage = static_cast<mesa_shader_stage>(stage + 1)) {
       const VkPipelineShaderStageCreateInfo *stage_info = stage_infos[stage];
       if (!stage_info)
@@ -3940,7 +4049,7 @@ tu_compile_shaders(struct tu_device *device,
 
    if (nir_initial_disasm) {
       for (mesa_shader_stage stage = MESA_SHADER_VERTEX;
-           stage < MESA_SHADER_STAGES;
+           stage < MESA_SHADER_MESH_STAGES;
            stage = static_cast<mesa_shader_stage>(stage + 1)) {
       if (!nir[stage])
          continue;
@@ -3950,7 +4059,20 @@ tu_compile_shaders(struct tu_device *device,
       }
    }
 
-   for (mesa_shader_stage stage = MESA_SHADER_VERTEX; stage < MESA_SHADER_STAGES;
+   if (nir[MESA_SHADER_MESH] &&
+       nir[MESA_SHADER_MESH]->info.stage == MESA_SHADER_MESH) {
+      if (nir_out) {
+         mesh_nir[0] = nir_shader_clone(NULL, nir[MESA_SHADER_MESH]);
+         if (nir[MESA_SHADER_TASK])
+            mesh_nir[1] = nir_shader_clone(NULL, nir[MESA_SHADER_TASK]);
+      }
+      tu_lower_mesh_pipeline(device, nir, info, mem_ctx);
+   } else if (nir[MESA_SHADER_FRAGMENT]) {
+      tu_mesh_lower_fs_inputs(nir[MESA_SHADER_FRAGMENT], false);
+   }
+
+   for (mesa_shader_stage stage = MESA_SHADER_VERTEX;
+        stage < MESA_SHADER_MESH_STAGES;
         stage = static_cast<mesa_shader_stage>(stage + 1)) {
       if (!nir[stage])
          continue;
@@ -3962,16 +4084,18 @@ tu_compile_shaders(struct tu_device *device,
       stage_feedbacks[stage].duration += os_time_get_nano() - stage_start;
    }
 
-   tu_link_shaders(device, nir, MESA_SHADER_STAGES);
+   tu_link_shaders(device, nir, MESA_SHADER_FRAGMENT + 1);
 
    if (nir_out) {
       for (mesa_shader_stage stage = MESA_SHADER_VERTEX;
-           stage < MESA_SHADER_STAGES; stage = static_cast<mesa_shader_stage>(stage + 1)) {
-         if (!nir[stage])
+           stage <= MESA_SHADER_FRAGMENT; stage = static_cast<mesa_shader_stage>(stage + 1)) {
+         if (!nir[stage] || (stage == MESA_SHADER_VERTEX && nir[MESA_SHADER_MESH]))
             continue;
 
          nir_out[stage] = nir_shader_clone(NULL, nir[stage]);
       }
+      nir_out[MESA_SHADER_MESH] = mesh_nir[0];
+      nir_out[MESA_SHADER_TASK] = mesh_nir[1];
    }
 
    /* With pipelines, tessellation modes can be set on either shader, for
@@ -4024,7 +4148,8 @@ tu_compile_shaders(struct tu_device *device,
    if (nir[MESA_SHADER_TESS_CTRL] && !nir[MESA_SHADER_FRAGMENT])
       ir3_key.tcs_store_primid = true;
 
-   for (mesa_shader_stage stage = MESA_SHADER_VERTEX; stage < MESA_SHADER_STAGES;
+   for (mesa_shader_stage stage = MESA_SHADER_VERTEX;
+        stage < MESA_SHADER_MESH_STAGES;
         stage = static_cast<mesa_shader_stage>(stage + 1)) {
       if (!nir[stage] || shaders[stage])
          continue;
@@ -4054,7 +4179,8 @@ tu_compile_shaders(struct tu_device *device,
 fail:
    ralloc_free(mem_ctx);
 
-   for (mesa_shader_stage stage = MESA_SHADER_VERTEX; stage < MESA_SHADER_STAGES;
+   for (mesa_shader_stage stage = MESA_SHADER_VERTEX;
+        stage < MESA_SHADER_MESH_STAGES;
         stage = static_cast<mesa_shader_stage>(stage + 1)) {
       if (shaders[stage]) {
          tu_shader_destroy(device, shaders[stage]);
@@ -4075,7 +4201,11 @@ tu_shader_key_subgroup_size(struct tu_shader_key *key,
                             struct tu_device *dev)
 {
    enum ir3_wavesize_option api_wavesize, real_wavesize;
-   if (!dev->physical_device->expose_double_threadsize) {
+   if (subgroup_info &&
+       subgroup_info->requiredSubgroupSize < dev->compiler->info->threadsize_base) {
+      api_wavesize = IR3_HALF_ONLY;
+      real_wavesize = IR3_SINGLE_ONLY;
+   } else if (!dev->physical_device->expose_double_threadsize) {
       api_wavesize = IR3_SINGLE_ONLY;
       real_wavesize = IR3_SINGLE_ONLY;
    } else {
@@ -4232,6 +4362,45 @@ tu_destroy_empty_shaders(struct tu_device *dev)
    vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_gs->base);
    vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_fs->base);
    vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_fs_fdm->base);
+}
+
+static VkResult
+tu_mesh_setup_create(struct tu_device *dev, struct tu_shader **shader)
+{
+   nir_shader *nir =
+      tu_mesh_build_setup_cs(ir3_get_compiler_options(dev->compiler));
+
+   struct tu_shader_key key = {};
+   tu_shader_key_subgroup_size(&key, true, false, NULL, dev);
+   struct ir3_shader_key ir3_key = {};
+   struct tu_shader_info info = {};
+   struct tu_pipeline_layout layout = {};
+
+   tu_lower_nir(dev, nir, &key, &ir3_key, &info);
+   return tu_shader_create(dev, shader, nir, &key, &info, &ir3_key, NULL, 0,
+                           &layout, false);
+}
+
+VkResult
+tu_init_mesh_shading(struct tu_device *dev)
+{
+   if (p_atomic_read(&dev->mesh_setup))
+      return VK_SUCCESS;
+
+   VkResult result = VK_SUCCESS;
+   mtx_lock(&dev->mutex);
+   if (!dev->mesh_ring) {
+      result = tu_bo_init_new(dev, NULL, &dev->mesh_ring, TU_MESH_RING_SIZE,
+                              TU_BO_ALLOC_INTERNAL_RESOURCE, "mesh ring");
+   }
+   if (result == VK_SUCCESS && !dev->mesh_setup) {
+      struct tu_shader *setup;
+      result = tu_mesh_setup_create(dev, &setup);
+      if (result == VK_SUCCESS)
+         p_atomic_set(&dev->mesh_setup, setup);
+   }
+   mtx_unlock(&dev->mutex);
+   return result;
 }
 
 void

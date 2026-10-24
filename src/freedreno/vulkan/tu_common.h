@@ -138,7 +138,7 @@
 #define MAX_FDM_TEXEL_SIZE (1u << MAX_FDM_TEXEL_SIZE_LOG2)
 
 /* This granularity is arbitrary, but there are two competing concerns here:
- * 
+ *
  * - The fragment area has to always divide the offset, and we don't want the
  *   fragment area changing with the offset, so we have to clamp the fragment
  *   area to this granularity. Therefore larger granularities lead to lower
@@ -160,6 +160,8 @@ enum tu_predicate_bit {
    TU_PREDICATE_SUBSAMPLED_NO_FAST_STORE = 7,
    TU_PREDICATE_NON_SUBSAMPLED_FAST_STORE = 8,
    TU_PREDICATE_NON_SUBSAMPLED_NO_FAST_STORE = 9,
+   TU_PREDICATE_MESH_TASK = 10,
+   TU_PREDICATE_MESH = 11,
 };
 
 /* Onchip timestamp register layout. */

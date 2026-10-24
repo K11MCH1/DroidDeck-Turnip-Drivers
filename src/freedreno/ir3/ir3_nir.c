@@ -718,6 +718,61 @@ ir3_nir_min_lod_workaround(nir_shader *shader)
       nir_metadata_control_flow, NULL);
 }
 
+/* Sampling a cube map with a direction that has no defined face projection
+ * (a NaN component, the zero vector, or more than one infinite component)
+ * can hang the GPU. Such directions give undefined results, so replace NaN
+ * with zero, clamp to finite values and turn the zero vector into +Z.
+ */
+static bool
+ir3_nir_lower_cube_coord_cb(struct nir_builder *b, nir_tex_instr *tex,
+                            void *_data)
+{
+   if (tex->sampler_dim != GLSL_SAMPLER_DIM_CUBE)
+      return false;
+
+   int src_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (src_idx < 0)
+      return false;
+
+   b->cursor = nir_before_instr(&tex->instr);
+
+   nir_def *coord = tex->src[src_idx].src.ssa;
+   unsigned bit_size = coord->bit_size;
+   nir_def *dir = nir_trim_vector(b, coord, 3);
+   nir_def *max = nir_imm_floatN_t(b, bit_size == 16 ? 65504.0 : FLT_MAX,
+                                   bit_size);
+
+   dir = nir_bcsel(b, nir_fisnan(b, dir), nir_imm_zero(b, 3, bit_size), dir);
+   dir = nir_fclamp(b, dir, nir_fneg(b, max), max);
+
+   nir_def *abs = nir_fabs(b, dir);
+   nir_def *major = nir_fmax(b, nir_fmax(b, nir_channel(b, abs, 0),
+                                         nir_channel(b, abs, 1)),
+                             nir_channel(b, abs, 2));
+   nir_def *z = nir_bcsel(b, nir_feq_imm(b, major, 0.0),
+                          nir_imm_floatN_t(b, 1.0, bit_size),
+                          nir_channel(b, dir, 2));
+
+   nir_def *comps[4] = {
+      nir_channel(b, dir, 0),
+      nir_channel(b, dir, 1),
+      z,
+   };
+   if (coord->num_components > 3)
+      comps[3] = nir_channel(b, coord, 3);
+
+   nir_src_rewrite(&tex->src[src_idx].src,
+                   nir_vec(b, comps, coord->num_components));
+   return true;
+}
+
+static bool
+ir3_nir_lower_cube_coord(nir_shader *shader)
+{
+   return nir_shader_tex_pass(shader, ir3_nir_lower_cube_coord_cb,
+                              nir_metadata_control_flow, NULL);
+}
+
 void
 ir3_finalize_nir(struct ir3_compiler *compiler,
                  const struct ir3_shader_nir_options *options,
@@ -787,6 +842,9 @@ ir3_finalize_nir(struct ir3_compiler *compiler,
 
    NIR_PASS(_, s, ir3_nir_lower_sparse_residency);
    NIR_PASS(_, s, ir3_nir_min_lod_workaround);
+
+   if (compiler->info->props.cube_coord_hang_quirk)
+      NIR_PASS(_, s, ir3_nir_lower_cube_coord);
 
    /* for opencl kernels, TPL1_MODE_CNTL should be configured for
     * isammode=CL and .arraycoordroundmode = ROUND_NEAREST_EVEN,
@@ -1058,6 +1116,9 @@ ir3_nir_post_finalize(struct ir3_shader *shader)
        * it here. Beyond this point nir_intrinsic_load_subgroup_size will return
        * the "real" subgroup size.
        */
+      if (shader->options.api_wavesize == IR3_HALF_ONLY)
+         OPT(s, ir3_nir_lower_half_subgroups);
+
       unsigned subgroup_size = 0, max_subgroup_size = 0;
       ir3_shader_get_subgroup_size(compiler, &shader->options, s->info.stage,
                                    &subgroup_size, &max_subgroup_size);

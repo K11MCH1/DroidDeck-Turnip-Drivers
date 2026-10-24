@@ -876,3 +876,293 @@ ir3_nir_lower_shuffle(nir_shader *nir, struct ir3_shader *shader)
    return nir_shader_lower_instructions(nir, filter_shuffle, lower_shuffle,
                                         NULL);
 }
+
+/* Subgroups of half a wave: each half of a 64-wide wave is its own subgroup.
+ * Operations that depend on the subgroup size or span the subgroup are
+ * confined to the half of the invocation, leaving only whole-wave operations
+ * for the rest of the backend.
+ */
+#define HALF_SUBGROUP_SIZE 32
+
+static nir_def *
+half_index(nir_builder *b)
+{
+   return nir_ushr_imm(b, nir_load_subgroup_invocation(b),
+                       util_logbase2(HALF_SUBGROUP_SIZE));
+}
+
+static nir_def *
+half_invocation(nir_builder *b)
+{
+   return nir_iand_imm(b, nir_load_subgroup_invocation(b),
+                       HALF_SUBGROUP_SIZE - 1);
+}
+
+/* Ballot of the invocations in the half of the current invocation. */
+static nir_def *
+half_ballot(nir_builder *b, nir_def *cond)
+{
+   nir_def *ballot = nir_ballot(b, 2, 32, cond);
+   return nir_vector_extract(b, ballot, half_index(b));
+}
+
+static nir_def *
+to_ballot_type(nir_builder *b, nir_def *mask, const nir_def *def)
+{
+   return nir_pad_vector_imm_int(b, nir_u2uN(b, mask, def->bit_size), 0,
+                                 def->num_components);
+}
+
+static nir_def *
+from_ballot_type(nir_builder *b, nir_def *value)
+{
+   return nir_u2u32(b, nir_channel(b, value, 0));
+}
+
+static nir_def *
+build_half_mask(nir_builder *b, nir_intrinsic_op op)
+{
+   nir_def *id = half_invocation(b);
+
+   switch (op) {
+   case nir_intrinsic_load_subgroup_eq_mask:
+      return nir_ishl(b, nir_imm_int(b, 1), id);
+   case nir_intrinsic_load_subgroup_ge_mask:
+      return nir_ishl(b, nir_imm_int(b, ~0), id);
+   case nir_intrinsic_load_subgroup_gt_mask:
+      return nir_ishl(b, nir_imm_int(b, ~1), id);
+   case nir_intrinsic_load_subgroup_le_mask:
+      return nir_inot(b, nir_ishl(b, nir_imm_int(b, ~1), id));
+   case nir_intrinsic_load_subgroup_lt_mask:
+      return nir_inot(b, nir_ishl(b, nir_imm_int(b, ~0), id));
+   default:
+      UNREACHABLE("not a subgroup mask");
+   }
+}
+
+/* Reads a value from one invocation of each half. The indices are uniform
+ * across the wave, so no half has to run on its own.
+ */
+static nir_def *
+build_half_read(nir_builder *b, nir_def *val, nir_def *index[2])
+{
+   nir_def *lo = nir_read_invocation(b, val, index[0]);
+   nir_def *hi = nir_read_invocation(b, val, index[1]);
+   return nir_bcsel(b, nir_ieq_imm(b, half_index(b), 0), lo, hi);
+}
+
+static void
+build_half_first(nir_builder *b, nir_def *first[2])
+{
+   nir_def *ballot = nir_ballot(b, 2, 32, nir_imm_true(b));
+   for (unsigned i = 0; i < 2; i++) {
+      nir_def *lsb = nir_find_lsb(b, nir_channel(b, ballot, i));
+      first[i] = nir_iadd_imm(b, nir_iand_imm(b, lsb, HALF_SUBGROUP_SIZE - 1),
+                              i * HALF_SUBGROUP_SIZE);
+   }
+}
+
+static nir_def *
+build_half_read_first(nir_builder *b, nir_def *val)
+{
+   nir_def *first[2];
+   build_half_first(b, first);
+   return build_half_read(b, val, first);
+}
+
+static nir_def *
+build_half_read_invocation(nir_builder *b, nir_def *val, nir_def *index)
+{
+   nir_def *first[2], *indices[2];
+   build_half_first(b, first);
+   for (unsigned i = 0; i < 2; i++) {
+      nir_def *id = nir_read_invocation(b, index, first[i]);
+      indices[i] = nir_iadd_imm(b, nir_iand_imm(b, id, HALF_SUBGROUP_SIZE - 1),
+                                i * HALF_SUBGROUP_SIZE);
+   }
+   return build_half_read(b, val, indices);
+}
+
+/* The upper half scans with the lower half replaced by the identity, which
+ * leaves the lower half's own scan unchanged.
+ */
+static nir_def *
+build_half_scan(nir_builder *b, nir_intrinsic_instr *intr)
+{
+   nir_op op = nir_intrinsic_reduction_op(intr);
+   nir_def *val = intr->src[0].ssa;
+   nir_const_value identity = nir_alu_binop_identity(op, val->bit_size);
+   nir_def *identity_def =
+      nir_replicate(b, nir_build_imm(b, 1, val->bit_size, &identity),
+                    val->num_components);
+   nir_def *upper = nir_ine_imm(b, half_index(b), 0);
+   nir_def *upper_val = nir_bcsel(b, upper, val, identity_def);
+
+   nir_def *lo, *hi;
+   if (intr->intrinsic == nir_intrinsic_inclusive_scan) {
+      lo = nir_inclusive_scan(b, val, .reduction_op = op);
+      hi = nir_inclusive_scan(b, upper_val, .reduction_op = op);
+   } else {
+      lo = nir_exclusive_scan(b, val, .reduction_op = op);
+      hi = nir_exclusive_scan(b, upper_val, .reduction_op = op);
+   }
+   return nir_bcsel(b, upper, hi, lo);
+}
+
+static nir_def *
+build_num_half_subgroups(nir_builder *b)
+{
+   nir_def *count;
+
+   if (b->shader->info.workgroup_size_variable) {
+      nir_def *size = nir_load_workgroup_size(b);
+      count = nir_imul(b, nir_imul(b, nir_channel(b, size, 0),
+                                   nir_channel(b, size, 1)),
+                       nir_channel(b, size, 2));
+   } else {
+      count = nir_imm_int(b, nir_static_workgroup_size(b->shader));
+   }
+
+   return nir_udiv_imm(b, nir_iadd_imm(b, count, HALF_SUBGROUP_SIZE - 1),
+                       HALF_SUBGROUP_SIZE);
+}
+
+static nir_def *
+build_half_vote_eq(nir_builder *b, nir_intrinsic_instr *intr)
+{
+   nir_def *val = intr->src[0].ssa;
+   nir_def *first = build_half_read_first(b, val);
+   nir_def *differs = nir_imm_false(b);
+
+   for (unsigned i = 0; i < val->num_components; i++) {
+      nir_def *x = nir_channel(b, val, i);
+      nir_def *y = nir_channel(b, first, i);
+      differs = nir_ior(b, differs, intr->intrinsic == nir_intrinsic_vote_feq
+                                       ? nir_fneu(b, x, y)
+                                       : nir_ine(b, x, y));
+   }
+
+   return nir_ieq_imm(b, half_ballot(b, differs), 0);
+}
+
+static bool
+lower_half_subgroup_intrinsic(nir_builder *b, nir_intrinsic_instr *intr,
+                              void *data)
+{
+   b->cursor = nir_before_instr(&intr->instr);
+
+   nir_def *res;
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_subgroup_size:
+      res = nir_imm_int(b, HALF_SUBGROUP_SIZE);
+      break;
+   case nir_intrinsic_load_subgroup_invocation:
+      res = half_invocation(b);
+      break;
+   case nir_intrinsic_load_subgroup_id:
+      res = nir_iadd(b, nir_imul_imm(b, nir_load_subgroup_id(b), 2),
+                     half_index(b));
+      break;
+   case nir_intrinsic_load_num_subgroups:
+      res = build_num_half_subgroups(b);
+      break;
+   case nir_intrinsic_load_subgroup_eq_mask:
+   case nir_intrinsic_load_subgroup_ge_mask:
+   case nir_intrinsic_load_subgroup_gt_mask:
+   case nir_intrinsic_load_subgroup_le_mask:
+   case nir_intrinsic_load_subgroup_lt_mask:
+      res = to_ballot_type(b, build_half_mask(b, intr->intrinsic), &intr->def);
+      break;
+   case nir_intrinsic_ballot:
+      res = to_ballot_type(b, half_ballot(b, intr->src[0].ssa), &intr->def);
+      break;
+   case nir_intrinsic_inverse_ballot:
+      res = nir_test_mask(b, nir_ushr(b, from_ballot_type(b, intr->src[0].ssa),
+                                      half_invocation(b)), 1);
+      break;
+   case nir_intrinsic_ballot_bitfield_extract:
+      res = nir_test_mask(b, nir_ushr(b, from_ballot_type(b, intr->src[0].ssa),
+                                      intr->src[1].ssa), 1);
+      break;
+   case nir_intrinsic_ballot_bit_count_reduce:
+      res = nir_bit_count(b, from_ballot_type(b, intr->src[0].ssa));
+      break;
+   case nir_intrinsic_ballot_bit_count_inclusive:
+   case nir_intrinsic_ballot_bit_count_exclusive: {
+      nir_intrinsic_op mask =
+         intr->intrinsic == nir_intrinsic_ballot_bit_count_inclusive
+            ? nir_intrinsic_load_subgroup_le_mask
+            : nir_intrinsic_load_subgroup_lt_mask;
+      res = nir_bit_count(b, nir_iand(b, from_ballot_type(b, intr->src[0].ssa),
+                                      build_half_mask(b, mask)));
+      break;
+   }
+   case nir_intrinsic_ballot_find_lsb:
+      res = nir_find_lsb(b, from_ballot_type(b, intr->src[0].ssa));
+      break;
+   case nir_intrinsic_ballot_find_msb:
+      res = nir_ufind_msb(b, from_ballot_type(b, intr->src[0].ssa));
+      break;
+   case nir_intrinsic_vote_any:
+      res = nir_ine_imm(b, half_ballot(b, intr->src[0].ssa), 0);
+      break;
+   case nir_intrinsic_vote_all:
+      res = nir_ieq_imm(b, half_ballot(b, nir_inot(b, intr->src[0].ssa)), 0);
+      break;
+   case nir_intrinsic_vote_ieq:
+   case nir_intrinsic_vote_feq:
+      res = build_half_vote_eq(b, intr);
+      break;
+   case nir_intrinsic_elect:
+      res = nir_ieq(b, half_invocation(b),
+                    nir_find_lsb(b, half_ballot(b, nir_imm_true(b))));
+      break;
+   case nir_intrinsic_read_first_invocation:
+      res = build_half_read_first(b, intr->src[0].ssa);
+      break;
+   case nir_intrinsic_read_invocation:
+      res = build_half_read_invocation(b, intr->src[0].ssa, intr->src[1].ssa);
+      break;
+   case nir_intrinsic_inclusive_scan:
+   case nir_intrinsic_exclusive_scan:
+      res = build_half_scan(b, intr);
+      break;
+   case nir_intrinsic_shuffle: {
+      nir_def *base = nir_iand_imm(b, nir_load_subgroup_invocation(b),
+                                   ~(HALF_SUBGROUP_SIZE - 1));
+      nir_def *id = nir_iand_imm(b, intr->src[1].ssa, HALF_SUBGROUP_SIZE - 1);
+      res = nir_shuffle(b, intr->src[0].ssa, nir_ior(b, base, id));
+      break;
+   }
+   case nir_intrinsic_reduce:
+   case nir_intrinsic_rotate: {
+      unsigned cluster_size = nir_intrinsic_cluster_size(intr);
+      if (cluster_size && cluster_size <= HALF_SUBGROUP_SIZE)
+         return false;
+      nir_intrinsic_set_cluster_size(intr, HALF_SUBGROUP_SIZE);
+      return true;
+   }
+   default:
+      /* Relative shuffles and quad operations never leave the half for
+       * defined results.
+       */
+      return false;
+   }
+
+   nir_def_replace(&intr->def, res);
+   return true;
+}
+
+bool
+ir3_nir_lower_half_subgroups(nir_shader *nir)
+{
+   bool progress = nir_shader_intrinsics_pass(nir, lower_half_subgroup_intrinsic,
+                                              nir_metadata_control_flow, NULL);
+
+   /* Subgroup intrinsics now refer to the whole wave. */
+   nir->info.api_subgroup_size = 2 * HALF_SUBGROUP_SIZE;
+   nir->info.max_subgroup_size = 2 * HALF_SUBGROUP_SIZE;
+   nir->info.min_subgroup_size = 2 * HALF_SUBGROUP_SIZE;
+
+   return progress;
+}

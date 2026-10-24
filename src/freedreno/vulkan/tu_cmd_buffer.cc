@@ -1350,12 +1350,21 @@ tu6_update_msaa(struct tu_cmd_buffer *cmd)
    tu6_emit_msaa<CHIP>(&cmd->draw_cs, samples, cmd->state.msaa_disable);
 }
 
+static VkPrimitiveTopology
+tu_primitive_topology(const struct tu_cmd_buffer *cmd)
+{
+   const struct tu_shader *ms = cmd->state.shaders[MESA_SHADER_MESH];
+   if (ms)
+      return static_cast<VkPrimitiveTopology>(ms->mesh.topology);
+   return static_cast<VkPrimitiveTopology>(
+      cmd->vk.dynamic_graphics_state.ia.primitive_topology);
+}
+
 template <chip CHIP>
 static void
 tu6_update_msaa_disable(struct tu_cmd_buffer *cmd)
 {
-   VkPrimitiveTopology topology =
-      static_cast<VkPrimitiveTopology>(cmd->vk.dynamic_graphics_state.ia.primitive_topology);
+   VkPrimitiveTopology topology = tu_primitive_topology(cmd);
    bool is_line =
       topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST ||
       topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY ||
@@ -1425,6 +1434,12 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
       return true;
    }
 
+   bool no_gmem = cmd->device->physical_device->dev_info.props.disable_gmem;
+   if (no_gmem) {
+       cmd->state.rp.force_render_mode_reason = "Unsupported GPU";
+       return true;
+    }
+
    /* can't fit attachments into gmem */
    if (!cmd->state.tiling->possible) {
       cmd->state.rp.force_render_mode_reason = "Can't fit attachments into gmem";
@@ -1448,6 +1463,11 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
 
    if (cmd->state.rp.has_tess) {
       cmd->state.rp.force_render_mode_reason = "Uses tessellation shaders";
+      return true;
+   }
+
+   if (cmd->state.rp.has_mesh) {
+      cmd->state.rp.force_render_mode_reason = "Uses mesh shaders";
       return true;
    }
 
@@ -2493,6 +2513,8 @@ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
          .gfx_shared_const = true,
          .cs_bindless = CHIP == A6XX ? 0x1f : 0xff,
          .gfx_bindless = CHIP == A6XX ? 0x1f : 0xff,));
+   if (CHIP >= A8XX)
+      tu_emit_bindless_invalidate<CHIP>(cs, true, true);
 
    tu_cs_emit_wfi(cs);
 
@@ -2580,7 +2602,7 @@ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
       tu_cs_emit_qw(cs, 0);
       tu_cs_emit(cs, CP_SET_AMBLE_2_TYPE(PREAMBLE_AMBLE_TYPE));
    }
-   
+
    if (dev->switch_away_amble_entry.size > 0 && track_preempt_latency) {
       tu_cs_emit_pkt7(cs, CP_SET_AMBLE, 3);
       tu_cs_emit_qw(cs, dev->switch_away_amble_entry.bo->iova + dev->switch_away_amble_entry.offset);
@@ -4768,6 +4790,46 @@ tu_CmdBindIndexBuffer2KHR(VkCommandBuffer commandBuffer,
 }
 TU_GENX(tu_CmdBindIndexBuffer2KHR);
 
+/* Points the bindless base registers of the graphics or compute stages at
+ * the given descriptor sets.
+ */
+template <chip CHIP>
+static void
+tu6_emit_bindless_bases(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                        const struct tu_descriptor_state *descriptors_state,
+                        bool compute)
+{
+   uint32_t sp_bindless_base_reg = compute ?
+      __SP_CS_BINDLESS_BASE_DESCRIPTOR<CHIP>(0, {}).reg :
+      __SP_GFX_BINDLESS_BASE_DESCRIPTOR<CHIP>(0, {}).reg;
+   uint32_t hlsq_bindless_base_reg = compute ?
+      REG_A6XX_HLSQ_CS_BINDLESS_BASE(0) : REG_A6XX_HLSQ_BINDLESS_BASE(0);
+
+   if (descriptors_state->max_sets_bound > 0) {
+      tu_cs_emit_pkt4(cs, sp_bindless_base_reg, 2 * descriptors_state->max_sets_bound);
+      tu_cs_emit_array(cs, (const uint32_t*)descriptors_state->set_iova, 2 * descriptors_state->max_sets_bound);
+      if (CHIP == A6XX) {
+         tu_cs_emit_pkt4(cs, hlsq_bindless_base_reg, 2 * descriptors_state->max_sets_bound);
+         tu_cs_emit_array(cs, (const uint32_t*)descriptors_state->set_iova, 2 * descriptors_state->max_sets_bound);
+      }
+   }
+
+   /* Dynamic descriptors get the reserved descriptor set. */
+   if (descriptors_state->max_dynamic_offset_size) {
+      int reserved_set_idx = cmd->device->physical_device->reserved_set_idx;
+      assert(reserved_set_idx >= 0); /* reserved set must be bound */
+
+      tu_cs_emit_pkt4(cs, sp_bindless_base_reg + reserved_set_idx * 2, 2);
+      tu_cs_emit_qw(cs, descriptors_state->set_iova[reserved_set_idx]);
+      if (CHIP == A6XX) {
+         tu_cs_emit_pkt4(cs, hlsq_bindless_base_reg + reserved_set_idx * 2, 2);
+         tu_cs_emit_qw(cs, descriptors_state->set_iova[reserved_set_idx]);
+      }
+   }
+
+   tu_emit_bindless_invalidate<CHIP>(cs, !compute, compute);
+}
+
 template <chip CHIP>
 static void
 tu6_emit_descriptor_sets(struct tu_cmd_buffer *cmd,
@@ -4775,13 +4837,9 @@ tu6_emit_descriptor_sets(struct tu_cmd_buffer *cmd,
 {
    struct tu_descriptor_state *descriptors_state =
       tu_get_descriptors_state(cmd, bind_point);
-   uint32_t sp_bindless_base_reg, hlsq_bindless_base_reg;
    struct tu_cs *cs, state_cs;
 
    if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
-      sp_bindless_base_reg = __SP_GFX_BINDLESS_BASE_DESCRIPTOR<CHIP>(0, {}).reg;
-      hlsq_bindless_base_reg = REG_A6XX_HLSQ_BINDLESS_BASE(0);
-
       unsigned bindless_pkt_size = descriptors_state->max_sets_bound ?
          1 + 2 * descriptors_state->max_sets_bound :
          0;
@@ -4800,41 +4858,11 @@ tu6_emit_descriptor_sets(struct tu_cmd_buffer *cmd,
       cs = &state_cs;
    } else {
       assert(bind_point == VK_PIPELINE_BIND_POINT_COMPUTE);
-
-      sp_bindless_base_reg = __SP_CS_BINDLESS_BASE_DESCRIPTOR<CHIP>(0, {}).reg;
-      hlsq_bindless_base_reg = REG_A6XX_HLSQ_CS_BINDLESS_BASE(0);
-
       cs = &cmd->cs;
    }
 
-   if (descriptors_state->max_sets_bound > 0) {
-      tu_cs_emit_pkt4(cs, sp_bindless_base_reg, 2 * descriptors_state->max_sets_bound);
-      tu_cs_emit_array(cs, reinterpret_cast<const uint32_t*>(descriptors_state->set_iova),
-                       2 * descriptors_state->max_sets_bound);
-      if (CHIP == A6XX) {
-         tu_cs_emit_pkt4(cs, hlsq_bindless_base_reg, 2 * descriptors_state->max_sets_bound);
-         tu_cs_emit_array(cs, reinterpret_cast<const uint32_t*>(descriptors_state->set_iova),
-                          2 * descriptors_state->max_sets_bound);
-      }
-   }
-
-   /* Dynamic descriptors get the reserved descriptor set. */
-   if (descriptors_state->max_dynamic_offset_size) {
-      int reserved_set_idx = cmd->device->physical_device->reserved_set_idx;
-      assert(reserved_set_idx >= 0); /* reserved set must be bound */
-
-      tu_cs_emit_pkt4(cs, sp_bindless_base_reg + reserved_set_idx * 2, 2);
-      tu_cs_emit_qw(cs, descriptors_state->set_iova[reserved_set_idx]);
-      if (CHIP == A6XX) {
-         tu_cs_emit_pkt4(cs, hlsq_bindless_base_reg + reserved_set_idx * 2, 2);
-         tu_cs_emit_qw(cs, descriptors_state->set_iova[reserved_set_idx]);
-      }
-   }
-
-   tu_cs_emit_regs(cs, SP_UPDATE_CNTL(CHIP,
-      .cs_bindless = bind_point == VK_PIPELINE_BIND_POINT_COMPUTE ? CHIP == A6XX ? 0x1f : 0xff : 0,
-      .gfx_bindless = bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS ? CHIP == A6XX ? 0x1f : 0xff : 0,
-   ));
+   tu6_emit_bindless_bases<CHIP>(cmd, cs, descriptors_state,
+                                 bind_point == VK_PIPELINE_BIND_POINT_COMPUTE);
 
    if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
       assert(cs->cur == cs->end); /* validate draw state size */
@@ -5636,6 +5664,8 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
    tu_bind_tes(cmd, pipeline->shaders[MESA_SHADER_TESS_EVAL]);
    tu_bind_gs(cmd, pipeline->shaders[MESA_SHADER_GEOMETRY]);
    tu_bind_fs(cmd, pipeline->shaders[MESA_SHADER_FRAGMENT]);
+   cmd->state.shaders[MESA_SHADER_TASK] = pipeline->shaders[MESA_SHADER_TASK];
+   cmd->state.shaders[MESA_SHADER_MESH] = pipeline->shaders[MESA_SHADER_MESH];
 
    /* We precompile static state and count it as dynamic, so we have to
     * manually clear bitset that tells which dynamic state is set, in order to
@@ -6318,6 +6348,7 @@ tu_render_pass_state_merge(struct tu_cmd_buffer *cmd, const struct tu_render_pas
    struct tu_render_pass_state *dst = &cmd->state.rp;
    dst->xfb_used |= src->xfb_used;
    dst->has_tess |= src->has_tess;
+   dst->has_mesh |= src->has_mesh;
    dst->has_prim_generated_query_in_rp |= src->has_prim_generated_query_in_rp;
    dst->has_vtx_stats_query_in_rp |= src->has_vtx_stats_query_in_rp;
    dst->has_zpass_done_sample_count_write_in_rp |= src->has_zpass_done_sample_count_write_in_rp;
@@ -7796,6 +7827,15 @@ tu6_emit_per_stage_push_consts(struct tu_cs *cs,
    }
 }
 
+static uint64_t
+tu_inline_ubo_iova(struct tu_cs *cs, const struct tu_inline_ubo *ubo,
+                   const struct tu_descriptor_state *descriptors)
+{
+   if (ubo->mesh_ring)
+      return cs->device->mesh_ring->iova;
+   return (descriptors->set_iova[ubo->base] & ~0x3f) + ubo->offset;
+}
+
 static void
 tu6_emit_inline_ubo(struct tu_cs *cs,
                     const struct tu_const_state *const_state,
@@ -7814,7 +7854,7 @@ tu6_emit_inline_ubo(struct tu_cs *cs,
       if (constlen <= ubo->const_offset_vec4)
          continue;
 
-      uint64_t va = descriptors->set_iova[ubo->base] & ~0x3f;
+      uint64_t va = tu_inline_ubo_iova(cs, ubo, descriptors);
 
       tu_cs_emit_pkt7(cs, tu6_stage2opcode(type), ubo->push_address ? 7 : 3);
       tu_cs_emit(cs, CP_LOAD_STATE6_0_DST_OFF(ubo->const_offset_vec4) |
@@ -7825,11 +7865,11 @@ tu6_emit_inline_ubo(struct tu_cs *cs,
       if (ubo->push_address) {
          tu_cs_emit(cs, 0);
          tu_cs_emit(cs, 0);
-         tu_cs_emit_qw(cs, va + ubo->offset);
+         tu_cs_emit_qw(cs, va);
          tu_cs_emit(cs, 0);
          tu_cs_emit(cs, 0);
       } else {
-         tu_cs_emit_qw(cs, va + ubo->offset);
+         tu_cs_emit_qw(cs, va);
       }
    }
 }
@@ -7842,18 +7882,14 @@ tu7_emit_inline_ubo(struct tu_cs *cs,
                     mesa_shader_stage type,
                     struct tu_descriptor_state *descriptors)
 {
-   uint64_t addresses[7] = {0};
+   uint64_t addresses[ARRAY_SIZE(const_state->ubos)] = {0};
    unsigned offset = const_state->inline_uniforms_ubo.idx;
 
    if (offset == -1)
       return;
 
-   for (unsigned i = 0; i < const_state->num_inline_ubos; i++) {
-      const struct tu_inline_ubo *ubo = &const_state->ubos[i];
-
-      uint64_t va = descriptors->set_iova[ubo->base] & ~0x3f;
-      addresses[i] = va + ubo->offset;
-   }
+   for (unsigned i = 0; i < const_state->num_inline_ubos; i++)
+      addresses[i] = tu_inline_ubo_iova(cs, &const_state->ubos[i], descriptors);
 
    /* A7XX TODO: Emit data via sub_cs instead of NOP */
    uint64_t iova = tu_cs_emit_data_nop(cs, reinterpret_cast<uint32_t *>(addresses),
@@ -8055,6 +8091,38 @@ tu_emit_bindless_base_addresses(struct tu_cs *cs,
 }
 
 template <chip CHIP>
+static void
+tu_emit_shared_consts(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                      const struct tu_push_constant_range *shared_consts,
+                      bool compute)
+{
+   if (shared_consts->type == IR3_PUSH_CONSTS_SHARED) {
+      tu6_emit_shared_consts(cs, shared_consts, cmd->push_constants, compute);
+   } else if (shared_consts->type == IR3_PUSH_CONSTS_SHARED_PREAMBLE) {
+      tu7_emit_shared_preamble_consts<CHIP>(cs, shared_consts, cmd->push_constants);
+   }
+}
+
+/* Emits the constants of a compute shader reading the given descriptors. */
+template <chip CHIP>
+static void
+tu_emit_cs_consts(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                  const struct tu_shader *shader,
+                  struct tu_descriptor_state *descriptors)
+{
+   tu_emit_shared_consts<CHIP>(cmd, cs, &shader->const_state.push_consts, true);
+   tu6_emit_per_stage_push_consts(cs, &shader->const_state,
+                                  shader->variant->const_state,
+                                  MESA_SHADER_COMPUTE, cmd->push_constants);
+   tu_emit_inline_ubo(cs, &shader->const_state, shader->variant->const_state,
+                      shader->variant->constlen, MESA_SHADER_COMPUTE,
+                      descriptors);
+   tu_emit_bindless_base_addresses(cs, &shader->const_state,
+                                   shader->variant->const_state,
+                                   MESA_SHADER_COMPUTE, descriptors);
+}
+
+template <chip CHIP>
 static struct tu_draw_state
 tu_emit_consts(struct tu_cmd_buffer *cmd, bool compute)
 {
@@ -8071,29 +8139,13 @@ tu_emit_consts(struct tu_cmd_buffer *cmd, bool compute)
    struct tu_cs cs;
    tu_cs_begin_sub_stream(&cmd->sub_cs, dwords, &cs);
 
-   if (shared_consts->type == IR3_PUSH_CONSTS_SHARED) {
-      tu6_emit_shared_consts(&cs, shared_consts, cmd->push_constants, compute);
-   } else if (shared_consts->type == IR3_PUSH_CONSTS_SHARED_PREAMBLE) {
-      tu7_emit_shared_preamble_consts<CHIP>(&cs, shared_consts, cmd->push_constants);
-   }
-
    if (compute) {
-      tu6_emit_per_stage_push_consts(
-         &cs, &cmd->state.shaders[MESA_SHADER_COMPUTE]->const_state,
-         cmd->state.shaders[MESA_SHADER_COMPUTE]->variant->const_state,
-         MESA_SHADER_COMPUTE, cmd->push_constants);
-      tu_emit_inline_ubo(
-         &cs, &cmd->state.shaders[MESA_SHADER_COMPUTE]->const_state,
-         cmd->state.shaders[MESA_SHADER_COMPUTE]->variant->const_state,
-         cmd->state.shaders[MESA_SHADER_COMPUTE]->variant->constlen,
-         MESA_SHADER_COMPUTE,
-         tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_COMPUTE));
-      tu_emit_bindless_base_addresses(
-         &cs, &cmd->state.shaders[MESA_SHADER_COMPUTE]->const_state,
-         cmd->state.shaders[MESA_SHADER_COMPUTE]->variant->const_state,
-         MESA_SHADER_COMPUTE,
+      tu_emit_cs_consts<CHIP>(
+         cmd, &cs, cmd->state.shaders[MESA_SHADER_COMPUTE],
          tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_COMPUTE));
    } else {
+      tu_emit_shared_consts<CHIP>(cmd, &cs, shared_consts, false);
+
       struct tu_descriptor_state *descriptors =
          tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
       for (uint32_t type = MESA_SHADER_VERTEX; type <= MESA_SHADER_FRAGMENT; type++) {
@@ -8817,7 +8869,7 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
                    MESA_VK_DYNAMIC_IA_PRIMITIVE_TOPOLOGY) ||
        BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
                    MESA_VK_DYNAMIC_RS_LINE_MODE) ||
-       (cmd->state.dirty & TU_CMD_DIRTY_TES) ||
+       (cmd->state.dirty & (TU_CMD_DIRTY_TES | TU_CMD_DIRTY_PROGRAM)) ||
        (cmd->state.dirty & TU_CMD_DIRTY_DRAW_STATE)) {
       tu6_update_msaa_disable<CHIP>(cmd);
    }
@@ -8924,8 +8976,7 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
 static uint32_t
 tu_draw_initiator(struct tu_cmd_buffer *cmd, enum pc_di_src_sel src_sel)
 {
-   enum pc_di_primtype primtype =
-      tu6_primtype(static_cast<VkPrimitiveTopology>(cmd->vk.dynamic_graphics_state.ia.primitive_topology));
+   enum pc_di_primtype primtype = tu6_primtype(tu_primitive_topology(cmd));
 
    if (primtype == DI_PT_PATCHES0)
       primtype = static_cast<enum pc_di_primtype>(primtype +
@@ -9874,10 +9925,10 @@ template <chip CHIP>
 static void
 tu_emit_compute_driver_params(struct tu_cmd_buffer *cmd,
                               struct tu_cs *cs,
+                              const struct tu_shader *shader,
                               const struct tu_dispatch_info *info)
 {
    mesa_shader_stage type = MESA_SHADER_COMPUTE;
-   const struct tu_shader *shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
    const struct ir3_shader_variant *variant = shader->variant;
    const struct ir3_const_state *const_state = variant->const_state;
    unsigned subgroup_size = variant->info.subgroup_size;
@@ -10071,11 +10122,14 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
       cmd->device->physical_device->info->props.instr_cache_size;
 
    /* We don't use draw states for dispatches, so the bound pipeline
-    * could be overwritten by reg stomping in a renderpass or blit.
+    * could be overwritten by reg stomping in a renderpass or blit, or by the
+    * compute shaders of a mesh draw.
     */
-   if (cmd->device->dbg_renderpass_stomp_cs) {
+   if (cmd->device->dbg_renderpass_stomp_cs ||
+       cmd->state.compute_program_stale) {
       tu_cs_emit_state_ib(&cmd->cs, shader->state);
       cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
+      cmd->state.compute_program_stale = false;
    }
 
    /* There appears to be a HW bug where in some rare circumstances it appears
@@ -10108,7 +10162,7 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
    /* note: no reason to have this in a separate IB */
    tu_cs_emit_state_ib(cs, tu_emit_consts<CHIP>(cmd, true));
 
-   tu_emit_compute_driver_params<CHIP>(cmd, cs, info);
+   tu_emit_compute_driver_params<CHIP>(cmd, cs, shader, info);
 
    if (cmd->state.dirty & TU_CMD_DIRTY_COMPUTE_DESC_SETS) {
       tu6_emit_descriptor_sets<CHIP>(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
@@ -10388,6 +10442,484 @@ tu_dispatch_unaligned_indirect(VkCommandBuffer commandBuffer,
 
    TU_CALLX(cmd_buffer->device, tu_dispatch)(cmd_buffer, &info);
 }
+
+/* Mesh draws run the task and mesh shaders as compute dispatches inside the
+ * render pass. A generated vertex shader then draws the primitives the mesh
+ * shader wrote to the mesh ring, one chunk of mesh workgroups at a time.
+ * Direct draws know their workgroup counts up front. Indirect and task draws
+ * build the workgroup table with the setup shader and predicate every chunk
+ * on the arguments it writes.
+ */
+
+struct tu_mesh_draw {
+   uint32_t groups[3];
+   uint64_t indirect;
+   uint64_t count;
+   uint32_t draw_count;
+   uint32_t stride;
+};
+
+struct tu_mesh_setup {
+   uint32_t table;
+   enum tu_mesh_source source;
+   uint64_t src;
+   uint32_t stride;
+   uint32_t max_count;
+   uint32_t count;
+   uint64_t count_iova;
+   uint32_t first;
+   uint32_t chunk;
+   uint32_t vertices;
+   uint32_t chunks;
+};
+
+static uint64_t
+tu_mesh_ring(const struct tu_cmd_buffer *cmd, uint32_t offset)
+{
+   return cmd->device->mesh_ring->iova + offset;
+}
+
+static uint64_t
+tu_mesh_chunk_args(const struct tu_cmd_buffer *cmd, uint32_t table,
+                   uint32_t chunk)
+{
+   return tu_mesh_ring(cmd, table + TU_MESH_TABLE_ARGS +
+                               chunk * TU_MESH_ARGS_SIZE);
+}
+
+/* Makes compute shader writes visible to later shaders and to the CP. */
+template <chip CHIP>
+static void
+tu_mesh_emit_shader_barrier(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+{
+   tu_cs_emit_wfi(cs);
+   tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_CLEAN);
+   tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_INVALIDATE);
+   tu_cs_emit_wfi(cs);
+   tu_cs_emit_pkt7(cs, CP_WAIT_FOR_ME, 0);
+}
+
+/* Makes CP memory writes visible to shaders. */
+template <chip CHIP>
+static void
+tu_mesh_emit_cp_barrier(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+{
+   tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
+   tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_INVALIDATE);
+   tu_cs_emit_wfi(cs);
+}
+
+/* Loads one of the compute shaders of a mesh draw. Dispatches can't use draw
+ * states and the draw CS can't call another IB, so the shader state is copied
+ * inline.
+ */
+template <chip CHIP>
+static void
+tu_mesh_emit_program(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                     const struct tu_shader *shader)
+{
+   const uint32_t *state = (const uint32_t *)
+      ((const char *) shader->bo.bo->map +
+       (shader->state.iova - shader->bo.bo->iova));
+   tu_cs_reserve(cs, shader->state.size);
+   tu_cs_emit_array(cs, state, shader->state.size);
+
+   struct tu_descriptor_state *descriptors =
+      tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   tu_emit_cs_consts<CHIP>(cmd, cs, shader, descriptors);
+   tu6_emit_dynamic_offset(cs, shader->variant, shader, &cmd->state.program);
+   tu6_emit_bindless_bases<CHIP>(cmd, cs, descriptors, true);
+}
+
+/* Dispatches groups workgroups along x numbered from base, or the workgroups
+ * given by the arguments at indirect.
+ */
+template <chip CHIP>
+static void
+tu_mesh_emit_dispatch(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                      const struct tu_shader *shader, uint32_t base,
+                      uint32_t groups, uint64_t indirect)
+{
+   const struct ir3_shader_variant *v = shader->variant;
+   const uint16_t *local_size = v->local_size;
+
+   struct tu_dispatch_info info = {};
+   info.blocks[0] = groups;
+   info.blocks[1] = 1;
+   info.blocks[2] = 1;
+   info.offsets[0] = base;
+   tu_emit_compute_driver_params<CHIP>(cmd, cs, shader, &info);
+
+   /* See tu_dispatch(). */
+   bool emit_instrlen_workaround =
+      v->instrlen > cmd->device->physical_device->info->props.instr_cache_size;
+   if (emit_instrlen_workaround) {
+      tu_cs_emit_regs(cs, A6XX_SP_PS_INSTR_SIZE(v->instrlen));
+      tu_emit_event_write<CHIP>(cmd, cs, FD_LABEL);
+   }
+
+   tu_set_render_mode<CHIP>(cs, {RM6_COMPUTE});
+
+   tu_cs_emit_regs(cs,
+                   SP_CS_NDRANGE_0(CHIP, .kerneldim = 3,
+                                         .localsizex = local_size[0] - 1,
+                                         .localsizey = local_size[1] - 1,
+                                         .localsizez = local_size[2] - 1),
+                   SP_CS_NDRANGE_1(CHIP, .globalsize_x = local_size[0] * groups),
+                   SP_CS_NDRANGE_2(CHIP, .globaloff_x = 0),
+                   SP_CS_NDRANGE_3(CHIP, .globalsize_y = local_size[1]),
+                   SP_CS_NDRANGE_4(CHIP, .globaloff_y = 0),
+                   SP_CS_NDRANGE_5(CHIP, .globalsize_z = local_size[2]),
+                   SP_CS_NDRANGE_6(CHIP, .globaloff_z = 0));
+   if (CHIP >= A7XX) {
+      tu_cs_emit_regs(cs,
+                      SP_CS_NDRANGE_7(CHIP, .localsizex = local_size[0] - 1,
+                                            .localsizey = local_size[1] - 1,
+                                            .localsizez = local_size[2] - 1));
+   }
+
+   if (cmd->device->physical_device->info->props.has_rt_workaround &&
+       v->info.uses_ray_intersection) {
+      tu_set_render_mode<CHIP>(cs, { .shader_uses_rt = true });
+   }
+
+   if (indirect) {
+      tu_cs_emit_pkt7(cs, CP_EXEC_CS_INDIRECT, 4);
+      tu_cs_emit(cs, 0x00000000);
+      tu_cs_emit_qw(cs, indirect);
+      tu_cs_emit(cs,
+                 A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEX(local_size[0] - 1) |
+                 A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEY(local_size[1] - 1) |
+                 A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEZ(local_size[2] - 1));
+   } else {
+      tu_cs_emit_pkt7(cs, CP_EXEC_CS, 4);
+      tu_cs_emit(cs, 0x00000000);
+      tu_cs_emit(cs, CP_EXEC_CS_1_NGROUPS_X(groups));
+      tu_cs_emit(cs, CP_EXEC_CS_2_NGROUPS_Y(1));
+      tu_cs_emit(cs, CP_EXEC_CS_3_NGROUPS_Z(1));
+   }
+
+   if (emit_instrlen_workaround)
+      tu_emit_event_write<CHIP>(cmd, cs, FD_LABEL);
+
+   tu_set_render_mode<CHIP>(cs, {RM6_DIRECT_RENDER});
+}
+
+/* Executes the following packets only if the chunk arguments at args are
+ * enabled.
+ */
+template <chip CHIP>
+static void
+tu_mesh_begin_chunk_cond(struct tu_cs *cs, uint64_t args,
+                         enum tu_predicate_bit bit)
+{
+   struct fd_reg_pair scratch = tu_scratch_reg<CHIP>(0);
+   cs->mem_to_reg(scratch, args + TU_MESH_ARG_ENABLE);
+
+   tu_cs_emit_pkt7(cs, CP_REG_TEST, 1);
+   tu_cs_emit(cs, A6XX_CP_REG_TEST_0_REG(scratch.reg) |
+                  A6XX_CP_REG_TEST_0_BIT(0) |
+                  A6XX_CP_REG_TEST_0_PRED_BIT(bit));
+
+   tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(PRED_TEST) |
+                          CP_COND_REG_EXEC_0_PRED_BIT(bit));
+}
+
+/* Writes a workgroup table holding a single direct launch. */
+template <chip CHIP>
+static void
+tu_mesh_emit_direct_table(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                          uint32_t table, const uint32_t groups[3])
+{
+   tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 3);
+   tu_cs_emit_qw(cs, tu_mesh_ring(cmd, table));
+   tu_cs_emit(cs, 1);
+
+   tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 2 + TU_MESH_TABLE_ENTRY_SIZE / 4);
+   tu_cs_emit_qw(cs, tu_mesh_ring(cmd, table + TU_MESH_TABLE_ENTRIES));
+   tu_cs_emit(cs, 0);
+   tu_cs_emit(cs, groups[0]);
+   tu_cs_emit(cs, groups[1]);
+   tu_cs_emit(cs, groups[2]);
+   for (unsigned i = 4; i < TU_MESH_TABLE_ENTRY_SIZE / 4; i++)
+      tu_cs_emit(cs, 0);
+
+   tu_mesh_emit_cp_barrier<CHIP>(cmd, cs);
+}
+
+/* Builds a workgroup table and its chunk arguments with the setup shader. */
+template <chip CHIP>
+static void
+tu_mesh_emit_setup(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                   const struct tu_mesh_setup *setup)
+{
+   uint32_t params[TU_MESH_PARAM_NUM];
+   params[TU_MESH_PARAM_TABLE] = setup->table;
+   params[TU_MESH_PARAM_SOURCE] = setup->source;
+   params[TU_MESH_PARAM_SRC_LO] = setup->src;
+   params[TU_MESH_PARAM_SRC_HI] = setup->src >> 32;
+   params[TU_MESH_PARAM_STRIDE] = setup->stride;
+   params[TU_MESH_PARAM_MAX_COUNT] = setup->max_count;
+   params[TU_MESH_PARAM_COUNT] = setup->count;
+   params[TU_MESH_PARAM_FIRST] = setup->first;
+   params[TU_MESH_PARAM_CHUNK] = setup->chunk;
+   params[TU_MESH_PARAM_VERTICES] = setup->vertices;
+   params[TU_MESH_PARAM_CHUNKS] = setup->chunks;
+
+   tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 2 + TU_MESH_PARAM_NUM);
+   tu_cs_emit_qw(cs, tu_mesh_ring(cmd, TU_MESH_PARAMS_OFFSET));
+   tu_cs_emit_array(cs, params, TU_MESH_PARAM_NUM);
+
+   if (setup->count_iova) {
+      tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
+      tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 5);
+      tu_cs_emit(cs, 0);
+      tu_cs_emit_qw(cs, tu_mesh_ring(cmd, TU_MESH_PARAMS_OFFSET +
+                                              TU_MESH_PARAM_COUNT * 4));
+      tu_cs_emit_qw(cs, setup->count_iova);
+   }
+
+   tu_mesh_emit_cp_barrier<CHIP>(cmd, cs);
+
+   tu_mesh_emit_program<CHIP>(cmd, cs, cmd->device->mesh_setup);
+   tu_mesh_emit_dispatch<CHIP>(cmd, cs, cmd->device->mesh_setup, 0, 1, 0);
+   tu_mesh_emit_shader_barrier<CHIP>(cmd, cs);
+}
+
+/* Runs the mesh shader over one chunk of the mesh table and draws its
+ * primitives.
+ */
+template <chip CHIP>
+static void
+tu_mesh_emit_chunk(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                   const struct tu_shader *ms, uint32_t base,
+                   uint32_t groups, uint64_t args)
+{
+   tu_mesh_emit_dispatch<CHIP>(cmd, cs, ms, base, groups, args);
+   tu_mesh_emit_shader_barrier<CHIP>(cmd, cs);
+
+   /* The compute state overwrote part of the fragment shader state. */
+   tu_cs_emit_pkt7(cs, CP_SET_DRAW_STATE, 3);
+   tu_cs_emit_draw_state(cs, TU_DRAW_STATE_FS, cmd->state.program.fs_state);
+
+   if (args) {
+      tu_cs_emit_pkt7(cs, CP_DRAW_INDIRECT_MULTI, 6);
+      tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX));
+      tu_cs_emit(cs, A6XX_CP_DRAW_INDIRECT_MULTI_1_OPCODE(INDIRECT_OP_NORMAL) |
+                     A6XX_CP_DRAW_INDIRECT_MULTI_1_DST_OFF(vs_params_offset(cmd)));
+      tu_cs_emit(cs, 1);
+      tu_cs_emit_qw(cs, args + TU_MESH_ARG_DRAW);
+      tu_cs_emit(cs, 0);
+   } else {
+      tu_cs_emit_pkt7(cs, CP_DRAW_INDX_OFFSET, 3);
+      tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX));
+      tu_cs_emit(cs, 1);
+      tu_cs_emit(cs, groups * ms->mesh.max_primitives * ms->mesh.verts_per_prim);
+   }
+
+   /* The next chunk reuses the records this draw reads. */
+   tu_cs_emit_wfi(cs);
+}
+
+/* Runs the mesh shader over the mesh table: count workgroups when known on
+ * the CPU, otherwise the chunks enabled by the setup shader.
+ */
+template <chip CHIP>
+static void
+tu_mesh_emit_ms_chunks(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                       bool gpu_driven, uint32_t count)
+{
+   const struct tu_shader *ms = cmd->state.shaders[MESA_SHADER_MESH];
+   uint32_t chunk = ms->mesh.chunk_workgroups;
+
+   tu_mesh_emit_program<CHIP>(cmd, cs, ms);
+
+   if (!gpu_driven) {
+      for (uint32_t base = 0; base < count; base += chunk) {
+         tu_mesh_emit_chunk<CHIP>(cmd, cs, ms, base, MIN2(chunk, count - base),
+                                  0);
+      }
+      return;
+   }
+
+   for (uint32_t i = 0; i < TU_MESH_MAX_CHUNKS; i++) {
+      uint64_t args = tu_mesh_chunk_args(cmd, TU_MESH_MS_TABLE_OFFSET, i);
+      tu_mesh_begin_chunk_cond<CHIP>(cs, args, TU_PREDICATE_MESH);
+      tu_mesh_emit_chunk<CHIP>(cmd, cs, ms, i * chunk, 0, args);
+      tu_cond_exec_end(cs);
+   }
+}
+
+/* Runs one chunk of the task table, then the mesh workgroups it launched. */
+template <chip CHIP>
+static void
+tu_mesh_emit_task_chunk(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                        uint32_t base, uint32_t groups, uint64_t args)
+{
+   const struct tu_shader *ts = cmd->state.shaders[MESA_SHADER_TASK];
+   const struct tu_shader *ms = cmd->state.shaders[MESA_SHADER_MESH];
+
+   tu_mesh_emit_program<CHIP>(cmd, cs, ts);
+   tu_mesh_emit_dispatch<CHIP>(cmd, cs, ts, base, groups, args);
+   tu_mesh_emit_shader_barrier<CHIP>(cmd, cs);
+
+   struct tu_mesh_setup setup = {
+      .table = TU_MESH_MS_TABLE_OFFSET,
+      .source = TU_MESH_SOURCE_TASK,
+      .stride = ts->mesh.task_payload_stride,
+      .max_count = ts->mesh.chunk_workgroups,
+      .count = groups,
+      .count_iova = args,
+      .chunk = ms->mesh.chunk_workgroups,
+      .vertices = (uint32_t) ms->mesh.max_primitives * ms->mesh.verts_per_prim,
+      .chunks = TU_MESH_MAX_CHUNKS,
+   };
+   tu_mesh_emit_setup<CHIP>(cmd, cs, &setup);
+   tu_mesh_emit_ms_chunks<CHIP>(cmd, cs, true, 0);
+}
+
+template <chip CHIP>
+static void
+tu_mesh_draw(struct tu_cmd_buffer *cmd, const struct tu_mesh_draw *draw)
+{
+   struct tu_cs *cs = &cmd->draw_cs;
+   const struct tu_shader *ts = cmd->state.shaders[MESA_SHADER_TASK];
+   const struct tu_shader *ms = cmd->state.shaders[MESA_SHADER_MESH];
+
+   if (draw->indirect)
+      tu6_emit_empty_vs_params<CHIP>(cmd);
+   else
+      tu6_emit_vs_params(cmd, NULL, 0, 0, 0);
+
+   tu6_draw_common<CHIP>(cmd, cs, false, 0);
+
+   cmd->state.rp.has_mesh = true;
+   cmd->state.compute_program_stale = true;
+   cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
+
+   if (!draw->indirect) {
+      uint32_t count = draw->groups[0] * draw->groups[1] * draw->groups[2];
+      tu_mesh_emit_direct_table<CHIP>(
+         cmd, cs, ts ? TU_MESH_TS_TABLE_OFFSET : TU_MESH_MS_TABLE_OFFSET,
+         draw->groups);
+
+      if (ts) {
+         uint32_t chunk = ts->mesh.chunk_workgroups;
+         for (uint32_t base = 0; base < count; base += chunk) {
+            tu_mesh_emit_task_chunk<CHIP>(cmd, cs, base,
+                                          MIN2(chunk, count - base), 0);
+         }
+      } else {
+         tu_mesh_emit_ms_chunks<CHIP>(cmd, cs, false, count);
+      }
+   } else {
+      for (uint32_t first = 0; first < draw->draw_count;
+           first += TU_MESH_TABLE_MAX_ENTRIES) {
+         struct tu_mesh_setup setup = {
+            .table = ts ? TU_MESH_TS_TABLE_OFFSET : TU_MESH_MS_TABLE_OFFSET,
+            .source = TU_MESH_SOURCE_INDIRECT,
+            .src = draw->indirect,
+            .stride = draw->stride,
+            .max_count = MIN2(draw->draw_count - first,
+                              TU_MESH_TABLE_MAX_ENTRIES),
+            .count = draw->draw_count,
+            .count_iova = draw->count,
+            .first = first,
+            .chunk = ts ? ts->mesh.chunk_workgroups
+                        : ms->mesh.chunk_workgroups,
+            .vertices = ts ? 0 : (uint32_t) ms->mesh.max_primitives *
+                                 ms->mesh.verts_per_prim,
+            .chunks = ts ? TU_MESH_MAX_TASK_CHUNKS : TU_MESH_MAX_CHUNKS,
+         };
+         tu_mesh_emit_setup<CHIP>(cmd, cs, &setup);
+
+         if (!ts) {
+            tu_mesh_emit_ms_chunks<CHIP>(cmd, cs, true, 0);
+            continue;
+         }
+
+         for (uint32_t i = 0; i < TU_MESH_MAX_TASK_CHUNKS; i++) {
+            uint64_t args = tu_mesh_chunk_args(cmd, TU_MESH_TS_TABLE_OFFSET, i);
+            tu_mesh_begin_chunk_cond<CHIP>(cs, args, TU_PREDICATE_MESH_TASK);
+            tu_mesh_emit_task_chunk<CHIP>(cmd, cs,
+                                          i * ts->mesh.chunk_workgroups, 0,
+                                          args);
+            tu_cond_exec_end(cs);
+         }
+      }
+   }
+
+   trace_end_draw(&cmd->rp_trace, cs);
+}
+
+template <chip CHIP>
+VKAPI_ATTR void VKAPI_CALL
+tu_CmdDrawMeshTasksEXT(VkCommandBuffer commandBuffer,
+                       uint32_t groupCountX,
+                       uint32_t groupCountY,
+                       uint32_t groupCountZ)
+{
+   VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+
+   if (!groupCountX || !groupCountY || !groupCountZ)
+      return;
+
+   struct tu_mesh_draw draw = {
+      .groups = { groupCountX, groupCountY, groupCountZ },
+   };
+   tu_mesh_draw<CHIP>(cmd, &draw);
+}
+TU_GENX(tu_CmdDrawMeshTasksEXT);
+
+template <chip CHIP>
+VKAPI_ATTR void VKAPI_CALL
+tu_CmdDrawMeshTasksIndirectEXT(VkCommandBuffer commandBuffer,
+                               VkBuffer _buffer,
+                               VkDeviceSize offset,
+                               uint32_t drawCount,
+                               uint32_t stride)
+{
+   VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(tu_buffer, buf, _buffer);
+
+   if (!drawCount)
+      return;
+
+   struct tu_mesh_draw draw = {
+      .indirect = vk_buffer_address(&buf->vk, offset),
+      .draw_count = drawCount,
+      .stride = stride,
+   };
+   tu_mesh_draw<CHIP>(cmd, &draw);
+}
+TU_GENX(tu_CmdDrawMeshTasksIndirectEXT);
+
+template <chip CHIP>
+VKAPI_ATTR void VKAPI_CALL
+tu_CmdDrawMeshTasksIndirectCountEXT(VkCommandBuffer commandBuffer,
+                                    VkBuffer _buffer,
+                                    VkDeviceSize offset,
+                                    VkBuffer countBuffer,
+                                    VkDeviceSize countBufferOffset,
+                                    uint32_t maxDrawCount,
+                                    uint32_t stride)
+{
+   VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(tu_buffer, buf, _buffer);
+   VK_FROM_HANDLE(tu_buffer, count_buf, countBuffer);
+
+   if (!maxDrawCount)
+      return;
+
+   struct tu_mesh_draw draw = {
+      .indirect = vk_buffer_address(&buf->vk, offset),
+      .count = vk_buffer_address(&count_buf->vk, countBufferOffset),
+      .draw_count = maxDrawCount,
+      .stride = stride,
+   };
+   tu_mesh_draw<CHIP>(cmd, &draw);
+}
+TU_GENX(tu_CmdDrawMeshTasksIndirectCountEXT);
 
 VKAPI_ATTR void VKAPI_CALL
 tu_CmdEndRenderPass2(VkCommandBuffer commandBuffer,

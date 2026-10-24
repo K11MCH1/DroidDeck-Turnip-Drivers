@@ -1392,6 +1392,12 @@ ir3_shader_get_subgroup_size(const struct ir3_compiler *compiler,
    case IR3_DOUBLE_ONLY:
       *subgroup_size = *max_subgroup_size = compiler->info->threadsize_base * 2;
       break;
+   case IR3_HALF_ONLY:
+      /* Half-wave subgroups are lowered onto single waves before anything
+       * else looks at the subgroup size.
+       */
+      *subgroup_size = *max_subgroup_size = compiler->info->threadsize_base;
+      break;
    case IR3_SINGLE_OR_DOUBLE:
       /* For vertex stages, we know the wavesize will never be doubled.
        * Lower subgroup_size here, to avoid having to deal with it when

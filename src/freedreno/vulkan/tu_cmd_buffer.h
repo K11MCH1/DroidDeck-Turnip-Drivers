@@ -199,7 +199,7 @@ enum tu_cmd_access_mask {
 enum tu_stage {
    /* As a destination stage, this is for operations on the CP which don't
     * wait for pending WFIs to complete and therefore need a CP_WAIT_FOR_ME.
-    * As a source stage, it is for things needing no waits. 
+    * As a source stage, it is for things needing no waits.
     */
    TU_STAGE_BV_CP,
 
@@ -320,6 +320,7 @@ struct tu_render_pass_state
 {
    bool xfb_used;
    bool has_tess;
+   bool has_mesh;
    bool has_prim_generated_query_in_rp;
    bool has_vtx_stats_query_in_rp;
    bool has_zpass_done_sample_count_write_in_rp;
@@ -494,7 +495,7 @@ struct tu_cmd_state
 {
    uint32_t dirty;
 
-   struct tu_shader *shaders[MESA_SHADER_STAGES];
+   struct tu_shader *shaders[MESA_SHADER_MESH_STAGES];
 
    struct tu_program_state program;
 
@@ -616,6 +617,12 @@ struct tu_cmd_state
    bool fdm_custom_resolve_subsampled;
 
    bool tessfactor_addr_set;
+
+   /* Mesh draws run their own compute shaders, so the bound compute pipeline
+    * state has to be emitted again before the next dispatch.
+    */
+   bool compute_program_stale;
+
    bool predication_active;
    bool msaa_disable;
    tu_lrz_blend_status lrz_blend_status;
@@ -929,6 +936,26 @@ void tu6_emit_blit_scissor(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 
 void tu_disable_draw_states(struct tu_cmd_buffer *cmd, struct tu_cs *cs);
 
+/* A8XX dropped the bindless bits from SP_UPDATE_CNTL, the bindless descriptor
+ * caches are invalidated through dedicated registers instead.
+ */
+template <chip CHIP>
+static inline void
+tu_emit_bindless_invalidate(struct tu_cs *cs, bool gfx, bool compute)
+{
+   if (CHIP >= A8XX) {
+      if (gfx)
+         tu_cs_emit_regs(cs, A6XX_SP_GFX_BINDLESS_INVALIDATE(.dword = 1));
+      if (compute)
+         tu_cs_emit_regs(cs, A6XX_SP_CS_BINDLESS_INVALIDATE(.dword = 1));
+   } else {
+      tu_cs_emit_regs(cs, SP_UPDATE_CNTL(CHIP,
+         .cs_bindless = compute ? CHIP == A6XX ? 0x1f : 0xff : 0,
+         .gfx_bindless = gfx ? CHIP == A6XX ? 0x1f : 0xff : 0,
+      ));
+   }
+}
+
 void tu6_apply_depth_bounds_workaround(struct tu_device *device,
                                        uint32_t *rb_depth_cntl);
 
@@ -1072,7 +1099,7 @@ tu_bin_offset(VkOffset2D fdm_offset, const struct tu_tiling_config *tiling)
 static inline uint32_t
 tu_fdm_num_layers(const struct tu_cmd_buffer *cmd)
 {
-   return cmd->state.pass->num_views ? cmd->state.pass->num_views : 
+   return cmd->state.pass->num_views ? cmd->state.pass->num_views :
       (cmd->state.fdm_per_layer ? cmd->state.framebuffer->layers : 1);
 }
 
