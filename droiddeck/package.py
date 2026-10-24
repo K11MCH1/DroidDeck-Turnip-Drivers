@@ -8,7 +8,7 @@ import subprocess
 import zipfile
 from pathlib import Path
 
-from pipeline import PROVENANCE, ROOT, git, validate_provenance
+from pipeline import ROOT, git, validate_provenance
 
 LIBRARY = 'libvulkan_freedreno.so'
 

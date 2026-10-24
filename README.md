@@ -17,6 +17,8 @@ Run **Actions → 1 - Patch Turnip → Run workflow** from `main`. Choose `mesa_
 
 This workflow saves a new branch named `codex/turnip/<variant>/<run-id>-<attempt>`. It checks that the Linux adjustments also apply, but does not compile or package. Its summary gives the branch and exact commit. Review the diff, or add your own Mesa source commits to that branch, before proceeding. Push and pull request runs validate all four variants without publishing branches.
 
+Initial prepared source is also available in `codex/turnip/standard/initial` and `codex/turnip/a8xx/initial`, based on upstream `ed2b00fa28dfc60061e21ecbe2280a49940fb470`. Both have passed local patch application and Linux compatibility checks.
+
 The patch order is in [droiddeck/patches.json](droiddeck/patches.json). Add future `.patch` or Python patch scripts under `droiddeck/patches/`, and list them in `extra` for all variants, a specific `banner` variant, or `linux` for stage 2. Paths are relative to `droiddeck/`; scripts run with the Mesa tree as their working directory. A patch error stops the workflow. Imported patches are pinned and vendored; nothing silently downloads a newer patch set during a build.
 
 The A8xx series is rebased as `droiddeck/patches/a8xx-mesa-main.patch`; the original patches remain in `vendor/banners`. Rebase details are recorded in `droiddeck/NOTICE`.

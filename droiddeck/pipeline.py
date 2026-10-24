@@ -66,6 +66,8 @@ def main():
     config = json.loads((ROOT / 'patches.json').read_text(encoding='utf-8'))
     assert_upstream(mesa)
     if args.stage == 'banner':
+        if git(mesa, 'status', '--porcelain', '--untracked-files=all'):
+            raise ValueError('Stage 1 requires a clean upstream tree, including untracked files')
         if (mesa / PROVENANCE).exists():
             raise ValueError('Stage 1 requires a fresh upstream source tree')
         source = git(mesa, 'rev-parse', 'HEAD')
